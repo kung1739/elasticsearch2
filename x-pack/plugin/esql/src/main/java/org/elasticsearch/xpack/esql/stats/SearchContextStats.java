@@ -169,7 +169,7 @@ public class SearchContextStats implements SearchStats {
         if (mayHoldUnmappedFields == null) {
             boolean mayHold = false;
             for (SearchExecutionContext context : contexts) {
-                if (context.mayHoldUnmappedFields()) {
+                if (context.unmappedFields().mayExist()) {
                     mayHold = true;
                     break;
                 }
@@ -184,13 +184,9 @@ public class SearchContextStats implements SearchStats {
         if (mayHoldUnmappedFields()) {
             return true;
         }
-        String name = field.string();
-        for (int dot = name.lastIndexOf('.'); dot > 0; dot = name.lastIndexOf('.', dot - 1)) {
-            String ancestor = name.substring(0, dot);
-            for (SearchExecutionContext context : contexts) {
-                if (context.isMappedField(ancestor)) {
-                    return true;
-                }
+        for (SearchExecutionContext context : contexts) {
+            if (context.unmappedFields().mayExist(field.string())) {
+                return true;
             }
         }
         return false;

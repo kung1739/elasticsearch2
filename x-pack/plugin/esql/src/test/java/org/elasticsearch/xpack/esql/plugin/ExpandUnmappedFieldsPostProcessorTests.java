@@ -239,7 +239,7 @@ public class ExpandUnmappedFieldsPostProcessorTests extends ComputeTestCase {
     }
 
     /**
-     * The coordinator trusts the data node to only send keys that hold a value - {@code UnmappedFieldsBlockLoaderTests} pins down that
+     * The coordinator trusts the data node to only send keys that hold a value - {@code UnmappedFieldsPatternLoadingTests} pins down that
      * end of the contract. This is the guard rail for the other end: were a value-less key to arrive anyway, it would expand into a
      * column that is null in every row, which reads as "every document has this field, with no value" where the truth is "no document
      * has this field". That must not pass silently.

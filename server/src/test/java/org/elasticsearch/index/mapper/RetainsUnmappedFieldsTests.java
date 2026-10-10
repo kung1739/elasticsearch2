@@ -28,7 +28,7 @@ import static org.hamcrest.Matchers.not;
 
 /**
  * Tests the {@code retains_unmapped_fields} property a mapping records about itself, and
- * {@link SearchExecutionContext#mayHoldUnmappedFields()}, which combines it with the index mode and with what the segments of a
+ * {@link UnmappedFields#mayExist()}, which combines it with the index mode and with what the segments of a
  * shard hold.
  */
 public class RetainsUnmappedFieldsTests extends MapperServiceTestCase {
@@ -166,14 +166,14 @@ public class RetainsUnmappedFieldsTests extends MapperServiceTestCase {
             b.field("dynamic", false);
             b.startObject("properties").startObject("field").field("type", "keyword").endObject().endObject();
         }));
-        assertFalse(createSearchExecutionContext(mapperService).mayHoldUnmappedFields());
+        assertFalse(createSearchExecutionContext(mapperService).unmappedFields().mayExist());
         assertMayHoldUnmappedFields(mapperService, b -> b.field("field", "value").field("unmapped", "value"), false);
     }
 
     public void testWithoutSearcher() throws IOException {
         MapperService mapperService = createMapperService(mapping(b -> b.startObject("field").field("type", "keyword").endObject()));
         assertRetains(mapperService, false);
-        assertTrue(createSearchExecutionContext(mapperService).mayHoldUnmappedFields());
+        assertTrue(createSearchExecutionContext(mapperService).unmappedFields().mayExist());
     }
 
     private static void assertRetains(MapperService mapperService, boolean expected) {
@@ -195,7 +195,7 @@ public class RetainsUnmappedFieldsTests extends MapperServiceTestCase {
         ParsedDocument toIndex = parsed;
         withLuceneIndex(mapperService, writer -> writer.addDocuments(toIndex.docs()), reader -> {
             SearchExecutionContext context = createSearchExecutionContext(mapperService, newSearcher(reader));
-            assertThat(context.mayHoldUnmappedFields(), equalTo(expected));
+            assertThat(context.unmappedFields().mayExist(), equalTo(expected));
         });
     }
 }

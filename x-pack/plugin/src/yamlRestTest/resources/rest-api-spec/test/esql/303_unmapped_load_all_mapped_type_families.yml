@@ -164,7 +164,16 @@ teardown:
   - match: { values.1: [ "unmapped", null ] }
 
 ---
-'the leaves under an unsupported object-shaped type are still discovered, in both legs':
+'the keys below an object-shaped field are fields only where it is not mapped':
+  # The columns still exist: the unmapped index discovers rng.gte and rng.lt from _source. Where rng is mapped, they are part
+  # of its value and not fields of their own, so that index returns null.
+  - requires:
+      capabilities:
+        - method: POST
+          path: /_query
+          parameters: [ method, path, parameters, capabilities ]
+          capabilities: [ optional_fields_load_all_skips_below_mapped_fields ]
+      reason: "LOAD_ALL does not discover what sits below a mapped field"
   - do:
       esql.query:
         body:
@@ -173,7 +182,7 @@ teardown:
   - match: { columns.1.name: rng.gte }
   - match: { columns.1.type: keyword }
   - match: { columns.2.name: rng.lt }
-  - match: { values.0: [ "mapped", "1", "9" ] }
+  - match: { values.0: [ "mapped", null, null ] }
   - match: { values.1: [ "unmapped", "1", "9" ] }
 
 ---

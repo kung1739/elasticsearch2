@@ -70,7 +70,7 @@ public interface SearchStats {
     /**
      * Whether a document of any shard behind these stats may hold, in {@code _source}, a field that the shard's mapping does
      * not declare. When this returns {@code false}, {@code unmapped_fields="LOAD_ALL"} has nothing to discover on this node.
-     * See {@code SearchExecutionContext#mayHoldUnmappedFields} for what decides it.
+     * See {@code UnmappedFields#mayExist()} for what decides it.
      */
     default boolean mayHoldUnmappedFields() {
         return true;

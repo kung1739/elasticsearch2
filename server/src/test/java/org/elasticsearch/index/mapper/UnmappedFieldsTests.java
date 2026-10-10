@@ -1,22 +1,19 @@
 /*
  * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one
- * or more contributor license agreements. Licensed under the Elastic License
- * 2.0; you may not use this file except in compliance with the Elastic License
- * 2.0.
+ * or more contributor license agreements. Licensed under the "Elastic License
+ * 2.0", the "GNU Affero General Public License v3.0 only", and the "Server Side
+ * Public License v 1"; you may not use this file except in compliance with, at
+ * your election, the "Elastic License 2.0", the "GNU Affero General Public
+ * License v3.0 only", or the "Server Side Public License, v 1".
  */
 
-package org.elasticsearch.xpack.esql.planner;
+package org.elasticsearch.index.mapper;
 
 import org.apache.lucene.util.BytesRef;
 import org.elasticsearch.common.breaker.CircuitBreaker;
 import org.elasticsearch.common.bytes.BytesArray;
 import org.elasticsearch.common.unit.ByteSizeValue;
-import org.elasticsearch.index.mapper.BlockLoader;
-import org.elasticsearch.index.mapper.BlockSourceReader;
-import org.elasticsearch.index.mapper.IgnoredSourceFieldMapper.IgnoredSourceFormat;
-import org.elasticsearch.index.mapper.TestBlock;
 import org.elasticsearch.search.lookup.Source;
-import org.elasticsearch.test.ESTestCase;
 import org.elasticsearch.xcontent.XContentType;
 
 import java.io.IOException;
@@ -24,16 +21,15 @@ import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.Set;
 
 import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.nullValue;
 
 /**
- * Tests that {@link UnmappedKeywordBlockLoader} reads a {@code _source} value onto the keyword typed attribute for an unmapped field:
- * an object value is read as {@code null}, an array contributes its scalar elements, and a scalar becomes a single value.
+ * Tests that {@link UnmappedFields#blockLoader(String)} reads a {@code _source} value as the keywords of an unmapped field: an
+ * object value is read as {@code null}, an array contributes its scalar elements, and a scalar becomes a single value.
  */
-public class UnmappedKeywordBlockLoaderTests extends ESTestCase {
+public class UnmappedFieldsTests extends MapperServiceTestCase {
 
     public void testScalarReadsAsSingleValue() throws IOException {
         assertThat(load("f", Map.of("f", "hello")), equalTo("hello"));
@@ -101,21 +97,21 @@ public class UnmappedKeywordBlockLoaderTests extends ESTestCase {
         assertThat(loadFrom("f", source), equalTo("1.5"));
     }
 
-    public void testDoesNotSupportOrdinals() {
-        UnmappedKeywordBlockLoader loader = loader("f");
+    public void testDoesNotSupportOrdinals() throws IOException {
+        BlockLoader loader = loader("f");
         assertThat(loader.supportsOrdinals(), equalTo(false));
         expectThrows(UnsupportedOperationException.class, () -> loader.ordinals(null));
     }
 
-    public void testNoColumnAtATimeReader() {
+    public void testNoColumnAtATimeReader() throws IOException {
         assertThat(loader("f").columnAtATimeReader(null), nullValue());
     }
 
     public void testToStringNamesTheFieldAndIsDistinctFromTheReader() throws IOException {
-        UnmappedKeywordBlockLoader loader = loader("some_field");
-        assertThat(loader.toString(), equalTo("UnmappedKeywordBlockLoader[some_field]"));
+        BlockLoader loader = loader("some_field");
+        assertThat(loader.toString(), equalTo("UnmappedFields.Named[some_field]"));
         try (BlockLoader.RowStrideReader reader = loader.rowStrideReader(newLimitedBreaker(ByteSizeValue.ofMb(1)), null)) {
-            assertThat(reader.toString(), equalTo("UnmappedKeywordBlockLoader.Reader[some_field]"));
+            assertThat(reader.toString(), equalTo("UnmappedFields.Named.Reader[some_field]"));
         }
     }
 
@@ -131,7 +127,7 @@ public class UnmappedKeywordBlockLoaderTests extends ESTestCase {
             Map.of("other", "x"),
             Map.of("f", List.of("d", "e"))
         );
-        UnmappedKeywordBlockLoader loader = loader("f");
+        BlockLoader loader = loader("f");
         try (BlockLoader.RowStrideReader reader = loader.rowStrideReader(newLimitedBreaker(ByteSizeValue.ofMb(1)), null)) {
             BlockLoader.Builder builder = loader.builder(TestBlock.factory(), docs.size());
             for (int doc = 0; doc < docs.size(); doc++) {
@@ -151,7 +147,7 @@ public class UnmappedKeywordBlockLoaderTests extends ESTestCase {
      */
     public void testReadingHoldsOnlyTheInheritedReservation() throws IOException {
         CircuitBreaker breaker = newLimitedBreaker(ByteSizeValue.ofMb(1));
-        UnmappedKeywordBlockLoader loader = loader("f");
+        BlockLoader loader = loader("f");
         try (BlockLoader.RowStrideReader reader = loader.rowStrideReader(breaker, null)) {
             assertThat(breaker.getUsed(), equalTo(BlockSourceReader.ESTIMATED_SIZE));
             BlockLoader.Builder builder = loader.builder(TestBlock.factory(), 1);
@@ -161,8 +157,31 @@ public class UnmappedKeywordBlockLoaderTests extends ESTestCase {
         assertThat(breaker.getUsed(), equalTo(0L));
     }
 
-    private static UnmappedKeywordBlockLoader loader(String fieldName) {
-        return new UnmappedKeywordBlockLoader(fieldName, Set.of(fieldName), IgnoredSourceFormat.NO_IGNORED_SOURCE);
+    /**
+     * A nested object reads from the root document like any array of objects, so a field below it that its mapping does
+     * not declare loads the values of all the nested objects.
+     */
+    public void testUndeclaredFieldBelowANestedObjectIsLoaded() throws IOException {
+        MapperService mapperService = createMapperService(topMapping(b -> {
+            b.field("dynamic", false);
+            b.startObject("properties").startObject("item").field("type", "nested").endObject().endObject();
+        }));
+        BlockLoader loader = createSearchExecutionContext(mapperService).unmappedFields().blockLoader("item.value");
+        try (BlockLoader.RowStrideReader reader = loader.rowStrideReader(newLimitedBreaker(ByteSizeValue.ofMb(1)), null)) {
+            BlockLoader.Builder builder = loader.builder(TestBlock.factory(), 1);
+            Source source = Source.fromBytes(new BytesArray("""
+                { "item": [ { "value": "a" }, { "value": "b" } ] }"""), XContentType.JSON);
+            reader.read(0, storedFields(source), builder);
+            assertThat(asValue(((TestBlock) builder.build()).get(0)), equalTo(List.of("a", "b")));
+        }
+    }
+
+    /**
+     * The loader for a field of a shard whose mapping keeps the fields it does not declare.
+     */
+    private BlockLoader loader(String fieldName) throws IOException {
+        MapperService mapperService = createMapperService(topMapping(b -> b.field("dynamic", false)));
+        return createSearchExecutionContext(mapperService).unmappedFields().blockLoader(fieldName);
     }
 
     /**
@@ -170,12 +189,12 @@ public class UnmappedKeywordBlockLoaderTests extends ESTestCase {
      * or a {@code List<String>} for a multivalue. {@link TestBlock} stores a position entry as a nested list, so the shape of the
      * return value is itself part of what these tests assert.
      */
-    private static Object load(String fieldName, Map<String, Object> sourceMap) throws IOException {
+    private Object load(String fieldName, Map<String, Object> sourceMap) throws IOException {
         return loadFrom(fieldName, Source.fromMap(sourceMap, XContentType.JSON));
     }
 
-    private static Object loadFrom(String fieldName, Source source) throws IOException {
-        UnmappedKeywordBlockLoader loader = loader(fieldName);
+    private Object loadFrom(String fieldName, Source source) throws IOException {
+        BlockLoader loader = loader(fieldName);
         try (BlockLoader.RowStrideReader reader = loader.rowStrideReader(newLimitedBreaker(ByteSizeValue.ofMb(1)), null)) {
             BlockLoader.Builder builder = loader.builder(TestBlock.factory(), 1);
             reader.read(0, storedFields(source), builder);
