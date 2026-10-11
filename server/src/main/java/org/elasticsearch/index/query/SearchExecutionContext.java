@@ -786,16 +786,19 @@ public class SearchExecutionContext extends QueryRewriteContext {
         if (searcher == null) {
             return false;
         }
-        if (fieldsInIndex == null) {
-            fieldsInIndex = new HashSet<>();
+        Set<String> fields = fieldsInIndex;
+        if (fields == null) {
+            Set<String> names = new HashSet<>();
             for (LeafReaderContext ctx : searcher.getIndexReader().leaves()) {
                 FieldInfos fis = ctx.reader().getFieldInfos();
                 for (FieldInfo fi : fis) {
-                    fieldsInIndex.add(fi.name);
+                    names.add(fi.name);
                 }
             }
+            // Immutable, so that a thread racing on the unsynchronized field can only see a complete set.
+            fields = fieldsInIndex = Set.copyOf(names);
         }
-        return fieldsInIndex.contains(fieldname);
+        return fields.contains(fieldname);
     }
 
     /**

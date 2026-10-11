@@ -181,9 +181,6 @@ public class SearchContextStats implements SearchStats {
 
     @Override
     public boolean mayHoldUnmappedField(FieldName field) {
-        if (mayHoldUnmappedFields()) {
-            return true;
-        }
         for (SearchExecutionContext context : contexts) {
             if (context.unmappedFields().mayExist(field.string())) {
                 return true;

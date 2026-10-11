@@ -88,7 +88,7 @@ setup:
 teardown:
   - do:
       indices.delete:
-        index: la_family_mapped,la_family_unmapped
+        index: la_family_mapped,la_family_unmapped,la_nested,la_plain
         ignore_unavailable: true
 
 ---
@@ -204,3 +204,86 @@ teardown:
   - match: { columns.1.type: keyword }
   - match: { values.0: [ "mapped", null ] }
   - match: { values.1: [ "unmapped", "n1" ] }
+
+---
+'a key below an object-shaped field is null by name where the field is mapped':
+  - requires:
+      capabilities:
+        - method: POST
+          path: /_query
+          parameters: [ method, path, parameters, capabilities ]
+          capabilities: [ optional_fields_nothing_below_mapped_fields ]
+      reason: "A key of the value of a mapped field is null by name"
+  - do:
+      esql.query:
+        body:
+          query: 'SET unmapped_fields="LOAD"; FROM la_family_mapped, la_family_unmapped | KEEP id, rng.gte | SORT id | LIMIT 5'
+  - match: { columns.1.name: rng.gte }
+  - match: { columns.1.type: keyword }
+  - match: { values.0: [ "mapped", null ] }
+  - match: { values.1: [ "unmapped", "1" ] }
+  - do:
+      esql.query:
+        body:
+          query: 'SET unmapped_fields="LOAD"; FROM la_family_mapped, la_family_unmapped | WHERE rng.gte == "1" | KEEP id | LIMIT 5'
+  - match: { values: [ [ "unmapped" ] ] }
+
+---
+'a field a nested object does not declare is read like any unmapped field':
+  # la_nested maps nst as nested and declares nothing below it; la_plain does not map nst at all. Each index decides for
+  # itself, and both read nst.extra from the root document, named or discovered.
+  - do:
+      indices.create:
+        index: la_nested
+        body:
+          mappings:
+            dynamic: false
+            properties:
+              id:
+                type: keyword
+              nst:
+                type: nested
+                dynamic: false
+  - do:
+      indices.create:
+        index: la_plain
+        body:
+          mappings:
+            dynamic: false
+            properties:
+              id:
+                type: keyword
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - { "index": { "_index": "la_nested", "_id": "1" } }
+          - { "id": "nested", "nst": [ { "extra": "n1" }, { "extra": "n2" } ] }
+          - { "index": { "_index": "la_nested", "_id": "2" } }
+          - { "id": "dotted", "nst.extra": "n3" }
+          - { "index": { "_index": "la_plain", "_id": "1" } }
+          - { "id": "plain", "nst": [ { "extra": "p1" }, { "extra": "p2" } ] }
+  - do:
+      esql.query:
+        body:
+          query: 'SET unmapped_fields="LOAD"; FROM la_nested, la_plain | KEEP id, nst.extra | SORT id | LIMIT 5'
+  - match: { columns.1.name: nst.extra }
+  - match: { columns.1.type: keyword }
+  - match: { values.0: [ "dotted", "n3" ] }
+  - match: { values.1: [ "nested", [ "n1", "n2" ] ] }
+  - match: { values.2: [ "plain", [ "p1", "p2" ] ] }
+  - do:
+      esql.query:
+        body:
+          query: 'SET unmapped_fields="LOAD_ALL"; FROM la_nested, la_plain | KEEP id, nst.* | SORT id | LIMIT 5'
+  - length: { columns: 2 }
+  - match: { columns.1.name: nst.extra }
+  - match: { values.0: [ "dotted", "n3" ] }
+  - match: { values.1: [ "nested", [ "n1", "n2" ] ] }
+  - match: { values.2: [ "plain", [ "p1", "p2" ] ] }
+  - do:
+      esql.query:
+        body:
+          query: 'SET unmapped_fields="LOAD_ALL"; FROM la_nested | KEEP id, nst.* | SORT id | LIMIT 5'
+  - length: { columns: 2 }
+  - match: { columns.1.name: nst.extra }

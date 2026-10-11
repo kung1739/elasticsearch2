@@ -142,11 +142,18 @@ teardown:
   - length: { values: 0 }
 
 ---
-'a key below a mapped field is still read by name':
+'a key below a mapped field is not an unmapped field':
+  - requires:
+      capabilities:
+        - method: POST
+          path: /_query
+          parameters: [ method, path, parameters, capabilities ]
+          capabilities: [ optional_fields_nothing_below_mapped_fields ]
+      reason: "A key of the value of a mapped field is null by name"
   - do:
       esql.query:
         body:
           query: 'SET unmapped_fields="LOAD"; FROM unmapped-none | KEEP id, span.gte | LIMIT 5'
   - match: { columns.1.name: span.gte }
   - match: { columns.1.type: keyword }
-  - match: { values.0: [ "1", "1" ] }
+  - match: { values.0: [ "1", null ] }

@@ -253,11 +253,11 @@ public class UnmappedFieldsPatternLoadingTests extends MapperServiceTestCase {
      */
     public void testBelowANestedObjectUndeclaredFieldsAreLoaded() throws IOException {
         Map<String, Object> filtered = load(UnmappedFieldsPattern.ALL, """
-            { "item": [ { "value": 1, "extra": "x" }, { "value": 2, "extra": "y" } ], "other": "z" }""");
-        assertMap(filtered, matchesMap().entry("item.value", List.of(1, 2)).entry("other", "z"));
+            { "item": [ { "value": 1, "extra": "x" }, { "value": 2, "extra": "y" } ], "item.value": 3, "other": "z" }""");
+        assertMap(filtered, matchesMap().entry("item.value", List.of(1, 2, 3)).entry("other", "z"));
 
         assertThat(load(UnmappedFieldsPattern.ALL, """
-            { "item": [ { "extra": "x" } ] }"""), nullValue());
+            { "item": [ { "extra": "x" } ], "item.extra": "y" }"""), nullValue());
     }
 
     /**
@@ -266,6 +266,11 @@ public class UnmappedFieldsPatternLoadingTests extends MapperServiceTestCase {
     public void testNothingBelowAMappedFieldIsLoaded() throws IOException {
         Map<String, Object> filtered = load(UnmappedFieldsPattern.ALL, """
             { "span": { "gte": 1, "lt": 5 }, "labels": { "env": "prod" }, "other": { "gte": 1 } }""");
+        assertMap(filtered, matchesMap().entry("other.gte", 1));
+
+        // A key spelled with dots is the same path.
+        filtered = load(UnmappedFieldsPattern.ALL, """
+            { "labels.env": "prod", "labels.a.b": 1, "span.gte": 2, "other.gte": 1 }""");
         assertMap(filtered, matchesMap().entry("other.gte", 1));
     }
 

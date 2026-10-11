@@ -15,6 +15,7 @@ import org.elasticsearch.index.IndexMode;
 import org.elasticsearch.index.IndexSettings;
 import org.elasticsearch.index.IndexVersion;
 import org.elasticsearch.index.IndexVersions;
+import org.elasticsearch.index.mapper.blockloader.ConstantNull;
 import org.elasticsearch.index.query.SearchExecutionContext;
 import org.elasticsearch.indices.recovery.RecoverySettings;
 import org.elasticsearch.test.index.IndexVersionUtils;
@@ -195,7 +196,13 @@ public class RetainsUnmappedFieldsTests extends MapperServiceTestCase {
         ParsedDocument toIndex = parsed;
         withLuceneIndex(mapperService, writer -> writer.addDocuments(toIndex.docs()), reader -> {
             SearchExecutionContext context = createSearchExecutionContext(mapperService, newSearcher(reader));
-            assertThat(context.unmappedFields().mayExist(), equalTo(expected));
+            UnmappedFields unmappedFields = context.unmappedFields();
+            assertThat(unmappedFields.mayExist(), equalTo(expected));
+            // Nothing is read, by name or by walking, from a shard that holds no unmapped field.
+            assertThat(unmappedFields.mayExist("not_in_the_mapping"), equalTo(expected));
+            assertThat(unmappedFields.blockLoader("not_in_the_mapping") == ConstantNull.INSTANCE, equalTo(expected == false));
+            BlockLoader all = unmappedFields.blockLoader(UnmappedFields.Filter.of(path -> true, path -> true), 1.0);
+            assertThat(all == ConstantNull.INSTANCE, equalTo(expected == false));
         });
     }
 }

@@ -30,11 +30,12 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.function.BiConsumer;
 import java.util.function.Predicate;
 
 /**
  * The fields of a shard's documents that its mapping does not declare. This is the one place that knows whether a shard can
- * hold such fields, where they are read from and what counts as one, so that whatever looks for them agrees on the answer.
+ * hold such fields, what counts as one and how they are read.
  * <p>
  * An unmapped field is a leaf of {@code _source}: an object is walked down to the values below it and is never a value
  * itself, an array contributes each of its elements under the name of the array, and a name spelled with dots is the same
@@ -43,73 +44,28 @@ import java.util.function.Predicate;
 public final class UnmappedFields {
 
     /**
-     * Decides which leaves a walk of {@code _source} is interested in. It is consulted while descending, one key at a time, so
-     * that a subtree holding nothing of interest is never entered. A filter carries what it has learnt about the path so far
-     * in a state, which it is handed back along with the path itself; an implementation may rely on either.
+     * Decides which unmapped fields a walk of {@code _source} is interested in.
      */
     public interface Filter {
-        /** The state from which neither the path reached nor any path below it is of interest. */
-        int REJECT = -1;
+        /** Whether a value at {@code path} is of interest. */
+        boolean accepts(String path);
 
-        /** The state before any key has been seen. */
-        int start();
+        /** Whether a value below {@code path} may be of interest. An object for which it is not is never entered. */
+        boolean mayAcceptBelow(String path);
 
-        /**
-         * The state after descending from {@code state} into {@code key}, which completes {@code path}.
-         */
-        int key(int state, String path, String key);
-
-        /**
-         * The state for the keys of an object found at {@code path}, which was reached in {@code state}.
-         */
-        int below(int state, String path);
-
-        /**
-         * Whether a value found at {@code path}, which was reached in {@code state}, is of interest.
-         */
-        boolean accepts(int state, String path);
-
-        /**
-         * A filter that decides on the path alone.
-         *
-         * @param accepts        whether a value at a path is of interest
-         * @param mayAcceptBelow whether a value at some path below a path may be of interest
-         */
         static Filter of(Predicate<String> accepts, Predicate<String> mayAcceptBelow) {
             return new Filter() {
                 @Override
-                public int start() {
-                    return 0;
-                }
-
-                @Override
-                public int key(int state, String path, String key) {
-                    return accepts.test(path) || mayAcceptBelow.test(path) ? 0 : REJECT;
-                }
-
-                @Override
-                public int below(int state, String path) {
-                    return mayAcceptBelow.test(path) ? 0 : REJECT;
-                }
-
-                @Override
-                public boolean accepts(int state, String path) {
+                public boolean accepts(String path) {
                     return accepts.test(path);
+                }
+
+                @Override
+                public boolean mayAcceptBelow(String path) {
+                    return mayAcceptBelow.test(path);
                 }
             };
         }
-    }
-
-    /**
-     * Receives the leaves a walk of {@code _source} finds.
-     */
-    @FunctionalInterface
-    public interface LeafConsumer {
-        /**
-         * @param path  the dotted path of the leaf
-         * @param value the value as {@code _source} holds it, {@code null} for a {@code null} element of an array
-         */
-        void accept(String path, @Nullable Object value);
     }
 
     private final IndexSettings indexSettings;
@@ -142,9 +98,6 @@ public final class UnmappedFields {
      *       dynamic fields that were skipped for exceeding a limit.</li>
      * </ul>
      * When the segments cannot be inspected, the answer is {@code true} unless the index mode alone decides.
-     * <p>
-     * A value a mapped field keeps under its own name, such as the keys of an object-valued field, is not an unmapped field
-     * and is not covered by this method. See {@link #mayExist(String)}.
      */
     public boolean mayExist() {
         if (indexSettings.getMode().isStrictColumnar() && indexSettings.isFlattenedUnmappedFieldsEnabled() == false) {
@@ -160,106 +113,89 @@ public final class UnmappedFields {
     }
 
     /**
-     * Whether reading {@code name} from {@code _source} can return a value on this shard, given that the shard does not map
-     * it. That takes either a shard that {@link #mayExist() may hold unmapped fields}, or one that maps a field above
-     * {@code name}: a mapped field keeps its whole value under its own name, so the keys of an object-valued one are read
-     * from {@code _source} without being fields of their own.
+     * Whether {@code name}, which this shard does not map, may be an unmapped field of one of its documents. It decides as
+     * {@link #forEachLeaf} does, so that a field is found by name exactly where a walk finds it.
      */
     public boolean mayExist(String name) {
-        if (mayExist()) {
-            return true;
-        }
-        for (int dot = name.lastIndexOf('.'); dot > 0; dot = name.lastIndexOf('.', dot - 1)) {
-            if (mappingLookup.getFieldType(name.substring(0, dot)) != null) {
+        return skipped("", name) == false && mayExist();
+    }
+
+    /**
+     * Walks {@code source} and hands every unmapped leaf that {@code filter} is interested in to {@code consumer}, with its
+     * dotted path and its value, in the order {@code source} holds them. A {@code null} is not a value, wherever it is.
+     * <p>
+     * A path that resolves to a field of this shard is not an unmapped field. Neither are the keys of a field whose type
+     * takes an object as its value, such as a range: they are part of that value. A path below a field of any other type
+     * is an unmapped field, as the field never read it.
+     * <p>
+     * A {@code nested} object is walked like any array of objects: a field its mapping does not declare is an unmapped
+     * field that holds the values of all of the nested objects.
+     */
+    void forEachLeaf(Map<String, Object> source, Filter filter, BiConsumer<String, Object> consumer) {
+        walkObject(source, "", filter, consumer);
+    }
+
+    /**
+     * Whether {@code path} is that of a field whose type takes an object as its value, so that nothing at or below it is an
+     * unmapped field.
+     */
+    private boolean skipped(String path) {
+        return mappingLookup.getMapper(path) instanceof FieldMapper field && field.supportsParsingObject();
+    }
+
+    /**
+     * Whether {@code key}, found in the object at {@code prefix}, is skipped along with everything below it. A key spelled
+     * with dots is checked as the path through the objects it names.
+     */
+    private boolean skipped(String prefix, String key) {
+        for (int dot = key.indexOf('.'); dot > 0; dot = key.indexOf('.', dot + 1)) {
+            if (skipped(prefix + key.substring(0, dot))) {
                 return true;
             }
         }
-        return false;
+        return skipped(prefix + key);
     }
 
-    /**
-     * Walks {@code source} and hands every unmapped leaf that {@code filter} is interested in to {@code consumer}, in the
-     * order {@code _source} holds them.
-     * <p>
-     * Nothing at or below a path this shard maps is an unmapped field: a mapped field keeps its whole value under its own
-     * name, whatever the shape of that value.
-     * <p>
-     * A {@code nested} object is walked like any array of objects, so a field its mapping does not declare is read from
-     * the root document as the values all of its nested objects hold for it.
-     */
-    public void forEachLeaf(Map<String, Object> source, Filter filter, LeafConsumer consumer) {
-        forEachLeaf(source, filter, path -> mappingLookup.getMapper(path) != null, consumer);
-    }
-
-    /**
-     * Walks {@code source} and hands every leaf that {@code filter} is interested in to {@code consumer}, in the order
-     * {@code source} holds them.
-     *
-     * @param skipped the paths that are left out along with everything below them
-     */
-    public static void forEachLeaf(Map<String, Object> source, Filter filter, Predicate<String> skipped, LeafConsumer consumer) {
-        walkObject(source, "", filter.start(), filter, skipped, consumer);
-    }
-
-    private static void walkObject(
-        Map<String, Object> object,
-        String prefix,
-        int state,
-        Filter filter,
-        Predicate<String> skipped,
-        LeafConsumer consumer
-    ) {
+    private void walkObject(Map<String, Object> object, String prefix, Filter filter, BiConsumer<String, Object> consumer) {
         for (Map.Entry<String, Object> entry : object.entrySet()) {
+            if (skipped(prefix, entry.getKey())) {
+                continue;
+            }
             String path = prefix + entry.getKey();
-            if (skipped.test(path)) {
-                continue;
-            }
-            int keyState = filter.key(state, path, entry.getKey());
-            if (keyState == Filter.REJECT) {
-                continue;
-            }
             Object value = entry.getValue();
             if (value instanceof Map<?, ?> child) {
-                walkBelow(child, path, keyState, filter, skipped, consumer);
+                walkBelow(child, path, filter, consumer);
             } else if (value instanceof List<?> elements) {
-                walkArray(elements, path, keyState, filter, skipped, consumer);
-            } else if (value != null && filter.accepts(keyState, path)) {
-                consumer.accept(path, value);
+                walkArray(elements, path, filter, consumer);
+            } else {
+                leaf(path, value, filter, consumer);
             }
         }
     }
 
-    private static void walkArray(
-        List<?> elements,
-        String path,
-        int state,
-        Filter filter,
-        Predicate<String> skipped,
-        LeafConsumer consumer
-    ) {
+    private void walkArray(List<?> elements, String path, Filter filter, BiConsumer<String, Object> consumer) {
         for (Object element : elements) {
             if (element instanceof Map<?, ?> child) {
-                walkBelow(child, path, state, filter, skipped, consumer);
+                walkBelow(child, path, filter, consumer);
             } else if (element instanceof List<?> nested) {
-                walkArray(nested, path, state, filter, skipped, consumer);
-            } else if (filter.accepts(state, path)) {
-                consumer.accept(path, element);
+                walkArray(nested, path, filter, consumer);
+            } else {
+                leaf(path, element, filter, consumer);
             }
         }
     }
 
     @SuppressWarnings("unchecked") // an object of _source is keyed by field name
-    private static void walkBelow(
-        Map<?, ?> object,
-        String path,
-        int state,
-        Filter filter,
-        Predicate<String> skipped,
-        LeafConsumer consumer
-    ) {
-        int below = filter.below(state, path);
-        if (below != Filter.REJECT) {
-            walkObject((Map<String, Object>) object, path + ".", below, filter, skipped, consumer);
+    private void walkBelow(Map<?, ?> object, String path, Filter filter, BiConsumer<String, Object> consumer) {
+        if (filter.mayAcceptBelow(path)) {
+            walkObject((Map<String, Object>) object, path + ".", filter, consumer);
+        }
+    }
+
+    private void leaf(String path, @Nullable Object value, Filter filter, BiConsumer<String, Object> consumer) {
+        // A name that resolves without a mapper of its own, such as a runtime field, is a field of the shard all the same.
+        if (value != null && filter.accepts(path) && mappingLookup.getFieldType(path) == null) {
+            consumer.accept(path, value);
         }
     }
 
@@ -407,12 +343,11 @@ public final class UnmappedFields {
                     breaker.addEstimateBytesAndMaybeBreak(reservation, "unmapped fields source");
                     try {
                         leaves.clear();
-                        unmappedFields.forEachLeaf(source.source(), filter, (path, value) -> {
-                            // A null says nothing about its field, like the nulls a mapped field does not keep.
-                            if (value != null) {
-                                leaves.computeIfAbsent(path, p -> new ArrayList<>(1)).add(value);
-                            }
-                        });
+                        unmappedFields.forEachLeaf(
+                            source.source(),
+                            filter,
+                            (path, value) -> leaves.computeIfAbsent(path, p -> new ArrayList<>(1)).add(value)
+                        );
                         if (leaves.isEmpty()) {
                             builder.appendNull();
                             return;

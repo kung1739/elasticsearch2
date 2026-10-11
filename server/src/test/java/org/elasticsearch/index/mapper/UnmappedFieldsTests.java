@@ -13,17 +13,25 @@ import org.apache.lucene.util.BytesRef;
 import org.elasticsearch.common.breaker.CircuitBreaker;
 import org.elasticsearch.common.bytes.BytesArray;
 import org.elasticsearch.common.unit.ByteSizeValue;
+import org.elasticsearch.common.xcontent.XContentHelper;
+import org.elasticsearch.index.mapper.blockloader.ConstantNull;
 import org.elasticsearch.search.lookup.Source;
 import org.elasticsearch.xcontent.XContentType;
+import org.elasticsearch.xcontent.json.JsonXContent;
 
 import java.io.IOException;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
+import static org.hamcrest.Matchers.containsInAnyOrder;
 import static org.hamcrest.Matchers.equalTo;
+import static org.hamcrest.Matchers.hasToString;
 import static org.hamcrest.Matchers.nullValue;
+import static org.hamcrest.Matchers.sameInstance;
 
 /**
  * Tests that {@link UnmappedFields#blockLoader(String)} reads a {@code _source} value as the keywords of an unmapped field: an
@@ -158,22 +166,139 @@ public class UnmappedFieldsTests extends MapperServiceTestCase {
     }
 
     /**
-     * A nested object reads from the root document like any array of objects, so a field below it that its mapping does
-     * not declare loads the values of all the nested objects.
+     * A nested object is walked like any array of objects: the fields its mapping declares are left out and the others
+     * hold the values of all of the nested objects, at any depth and by name too.
      */
-    public void testUndeclaredFieldBelowANestedObjectIsLoaded() throws IOException {
+    public void testUndeclaredFieldsBelowANestedObject() throws IOException {
         MapperService mapperService = createMapperService(topMapping(b -> {
             b.field("dynamic", false);
-            b.startObject("properties").startObject("item").field("type", "nested").endObject().endObject();
+            b.startObject("properties");
+            b.startObject("item").field("type", "nested").startObject("properties");
+            b.startObject("declared").field("type", "keyword").endObject();
+            b.startObject("inner").field("type", "nested").endObject();
+            b.endObject().endObject();
+            b.endObject();
         }));
-        BlockLoader loader = createSearchExecutionContext(mapperService).unmappedFields().blockLoader("item.value");
+        String json = """
+            {
+              "item": [ { "value": "a", "declared": "b", "obj": { "value": "c" }, "inner": [ { "value": "d" } ] }, { "value": "e" } ],
+              "item.value": "f",
+              "item.declared": "g"
+            }""";
+        assertThat(
+            leaves(mapperService, json),
+            equalTo(Map.of("item.value", List.of("a", "e", "f"), "item.obj.value", List.of("c"), "item.inner.value", List.of("d")))
+        );
+        UnmappedFields unmappedFields = createSearchExecutionContext(mapperService).unmappedFields();
+        for (String name : List.of("item.value", "item.obj.value", "item.inner.value")) {
+            assertTrue(name, unmappedFields.mayExist(name));
+            assertThat(name, unmappedFields.blockLoader(name), hasToString("UnmappedFields.Named[" + name + "]"));
+        }
+        BlockLoader loader = unmappedFields.blockLoader("item.value");
         try (BlockLoader.RowStrideReader reader = loader.rowStrideReader(newLimitedBreaker(ByteSizeValue.ofMb(1)), null)) {
             BlockLoader.Builder builder = loader.builder(TestBlock.factory(), 1);
-            Source source = Source.fromBytes(new BytesArray("""
-                { "item": [ { "value": "a" }, { "value": "b" } ] }"""), XContentType.JSON);
-            reader.read(0, storedFields(source), builder);
-            assertThat(asValue(((TestBlock) builder.build()).get(0)), equalTo(List.of("a", "b")));
+            reader.read(0, storedFields(Source.fromBytes(new BytesArray(json), XContentType.JSON)), builder);
+            assertThat((List<?>) asValue(((TestBlock) builder.build()).get(0)), containsInAnyOrder("a", "e", "f"));
         }
+    }
+
+    /**
+     * A key of the value of a mapped field is not an unmapped field, for the walk and by name. That holds for the types
+     * that take an object as their value only.
+     */
+    public void testNameBelowAMappedFieldIsNotAnUnmappedField() throws IOException {
+        MapperService mapperService = createMapperService(topMapping(b -> {
+            b.field("dynamic", false);
+            b.startObject("properties");
+            b.startObject("span").field("type", "integer_range").endObject();
+            b.startObject("labels").field("type", "flattened").endObject();
+            b.startObject("obj").startObject("properties").startObject("point").field("type", "geo_point").endObject().endObject();
+            b.endObject();
+            b.endObject();
+        }));
+        UnmappedFields unmappedFields = createSearchExecutionContext(mapperService).unmappedFields();
+        for (String name : List.of("span.gte", "labels.env", "labels.a.b", "obj.point.lat")) {
+            assertFalse(name, unmappedFields.mayExist(name));
+            assertThat(name, unmappedFields.blockLoader(name), sameInstance(ConstantNull.INSTANCE));
+        }
+        for (String name : List.of("spans.gte", "obj.other", "obj.points.lat")) {
+            assertTrue(name, unmappedFields.mayExist(name));
+        }
+        assertThat(leaves(mapperService, """
+            {
+              "span": { "gte": 1 }, "labels": { "env": "prod" }, "obj": { "point": { "lat": 1, "lon": 2 }, "other": 3 },
+              "spans": { "gte": 4 }
+            }"""), equalTo(Map.of("obj.other", List.of(3), "spans.gte", List.of(4))));
+    }
+
+    /**
+     * Whatever resolves to a field of the shard is left out: a field, its multi-fields, an alias and a runtime field.
+     */
+    public void testNamesThatResolveToAFieldAreLeftOut() throws IOException {
+        MapperService mapperService = createMapperService(topMapping(b -> {
+            b.field("dynamic", false);
+            b.startObject("runtime").startObject("computed").field("type", "keyword").endObject().endObject();
+            b.startObject("properties");
+            b.startObject("field").field("type", "keyword");
+            b.startObject("fields").startObject("raw").field("type", "keyword").endObject().endObject();
+            b.endObject();
+            b.startObject("alias").field("type", "alias").field("path", "field").endObject();
+            b.endObject();
+        }));
+        assertThat(leaves(mapperService, """
+            { "field": "a", "field.raw": "b", "alias": "c", "computed": "d", "other": "e" }"""), equalTo(Map.of("other", List.of("e"))));
+    }
+
+    /**
+     * A field whose type does not take an object never read what is below its path, so that is an unmapped field. It is
+     * how a document spells a field next to it where subobjects are disabled, and what a document stored before the field
+     * was mapped.
+     */
+    public void testPathsBelowAFieldThatTakesNoObject() throws IOException {
+        MapperService root = createMapperService(topMapping(b -> {
+            b.field("dynamic", false).field("subobjects", false);
+            b.startObject("properties").startObject("host").field("type", "keyword").endObject().endObject();
+        }));
+        assertThat(
+            leaves(root, """
+                { "host": "h", "host.name": "n", "other.name": "o" }"""),
+            equalTo(Map.of("host.name", List.of("n"), "other.name", List.of("o")))
+        );
+        assertThat(
+            createSearchExecutionContext(root).unmappedFields().blockLoader("host.name"),
+            hasToString("UnmappedFields.Named[host.name]")
+        );
+
+        MapperService inner = createMapperService(topMapping(b -> {
+            b.field("dynamic", false);
+            b.startObject("properties");
+            b.startObject("attributes").field("type", "object").field("subobjects", false).field("dynamic", false);
+            b.startObject("properties").startObject("host").field("type", "keyword").endObject().endObject();
+            b.endObject();
+            b.startObject("plain").field("type", "keyword").endObject();
+            b.endObject();
+        }));
+        assertThat(
+            leaves(inner, """
+                { "attributes": { "host": "h", "host.name": "n" }, "attributes.host.os": "o", "plain": { "below": "p" } }"""),
+            equalTo(Map.of("attributes.host.name", List.of("n"), "attributes.host.os", List.of("o"), "plain.below", List.of("p")))
+        );
+        UnmappedFields unmappedFields = createSearchExecutionContext(inner).unmappedFields();
+        assertTrue(unmappedFields.mayExist("plain.below"));
+        assertThat(unmappedFields.blockLoader("plain.below"), hasToString("UnmappedFields.Named[plain.below]"));
+    }
+
+    /** The unmapped leaves of a document, by path. */
+    private Map<String, List<Object>> leaves(MapperService mapperService, String json) {
+        Map<String, Object> source = XContentHelper.convertToMap(JsonXContent.jsonXContent, json, true);
+        Map<String, List<Object>> leaves = new LinkedHashMap<>();
+        createSearchExecutionContext(mapperService).unmappedFields()
+            .forEachLeaf(
+                source,
+                UnmappedFields.Filter.of(path -> true, path -> true),
+                (path, value) -> leaves.computeIfAbsent(path, p -> new ArrayList<>()).add(value)
+            );
+        return leaves;
     }
 
     /**
