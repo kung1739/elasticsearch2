@@ -35,9 +35,10 @@ import static org.hamcrest.Matchers.nullValue;
 
 /**
  * Tests which unmapped fields {@link UnmappedFields#blockLoader(UnmappedFields.Filter, double)} loads for an
- * {@link UnmappedFieldsPattern}: the leaves of {@code _source} that the pattern keeps and that hold a value, each under its
- * dotted path. Everything else is dropped on the shard: the mapped fields (which the analyzer adds to the pattern's excludes),
- * any leaf that does not match the includes, and any that carries nothing for the coordinator to turn into a column.
+ * {@link UnmappedFieldsPattern}: the leaves of {@code _source} that the pattern keeps and that hold a value, inside the
+ * objects and arrays that lead to them. Everything else is dropped on the shard: the mapped fields (which the analyzer
+ * adds to the pattern's excludes), any leaf that does not match the includes, and any that carries nothing for the
+ * coordinator to turn into a column.
  */
 public class UnmappedFieldsPatternLoadingTests extends MapperServiceTestCase {
 
@@ -86,10 +87,10 @@ public class UnmappedFieldsPatternLoadingTests extends MapperServiceTestCase {
         assertMap(filtered, matchesMap().entry("public_note", "hello"));
     }
 
-    public void testObjectsAreFlattenedToTheirLeaves() throws IOException {
+    public void testObjectsAreKeptAsObjects() throws IOException {
         Map<String, Object> filtered = load(UnmappedFieldsPattern.excludes(List.of("first_name")), """
             { "address": { "city": "Berlin", "zip": "10115" }, "tags": [ "a", "b" ], "first_name": "John" }""");
-        assertMap(filtered, matchesMap().entry("address.city", "Berlin").entry("address.zip", "10115").entry("tags", List.of("a", "b")));
+        assertMap(filtered, matchesMap().entry("address", Map.of("city", "Berlin", "zip", "10115")).entry("tags", List.of("a", "b")));
     }
 
     /** An array of scalars is a leaf named after the array, so it is held to the pattern like a scalar is. */
@@ -105,7 +106,7 @@ public class UnmappedFieldsPatternLoadingTests extends MapperServiceTestCase {
     public void testObjectIsEnteredWhenOnlyItsDescendantsCanMatch() throws IOException {
         Map<String, Object> filtered = load(UnmappedFieldsPattern.includes(List.of("address.*")), """
             { "address": { "city": "Berlin" }, "other": "x" }""");
-        assertMap(filtered, matchesMap().entry("address.city", "Berlin"));
+        assertMap(filtered, matchesMap().entry("address", Map.of("city", "Berlin")));
     }
 
     /** Same pattern and key as above, but a scalar at that key is a leaf of its own, which the pattern does not keep. */
@@ -163,7 +164,7 @@ public class UnmappedFieldsPatternLoadingTests extends MapperServiceTestCase {
     public void testSourceObjectWithAValueKeepsOnlyThatValue() throws IOException {
         Map<String, Object> filtered = load(UnmappedFieldsPattern.ALL, """
             { "extra": { "baz": "world", "empty": [], "null_leaf": null } }""");
-        assertMap(filtered, matchesMap().entry("extra.baz", "world"));
+        assertMap(filtered, matchesMap().entry("extra", Map.of("baz", "world")));
     }
 
     public void testOnlyValuelessSourceValuesEmitsNull() throws IOException {
@@ -184,13 +185,16 @@ public class UnmappedFieldsPatternLoadingTests extends MapperServiceTestCase {
     public void testNullsAreStrippedFromNestedArraysAndObjects() throws IOException {
         Map<String, Object> filtered = load(UnmappedFieldsPattern.ALL, """
             { "tags": [ null, [ "b", null ], [], { "keep": "me", "drop": [] } ] }""");
-        assertMap(filtered, matchesMap().entry("tags", "b").entry("tags.keep", "me"));
+        assertMap(filtered, matchesMap().entry("tags", List.of(List.of("b"), Map.of("keep", "me"))));
     }
 
     public void testEveryLeafWithAValueIsKept() throws IOException {
         Map<String, Object> filtered = load(UnmappedFieldsPattern.ALL, """
             { "tags": [ "a", "b" ], "address": { "city": "Berlin", "zips": [ "10115" ] } }""");
-        assertMap(filtered, matchesMap().entry("tags", List.of("a", "b")).entry("address.city", "Berlin").entry("address.zips", "10115"));
+        assertMap(
+            filtered,
+            matchesMap().entry("tags", List.of("a", "b")).entry("address", Map.of("city", "Berlin", "zips", List.of("10115")))
+        );
     }
 
     public void testReaderToStringIsDistinctFromLoader() throws IOException {
@@ -254,7 +258,10 @@ public class UnmappedFieldsPatternLoadingTests extends MapperServiceTestCase {
     public void testBelowANestedObjectUndeclaredFieldsAreLoaded() throws IOException {
         Map<String, Object> filtered = load(UnmappedFieldsPattern.ALL, """
             { "item": [ { "value": 1, "extra": "x" }, { "value": 2, "extra": "y" } ], "item.value": 3, "other": "z" }""");
-        assertMap(filtered, matchesMap().entry("item.value", List.of(1, 2, 3)).entry("other", "z"));
+        assertMap(
+            filtered,
+            matchesMap().entry("item", List.of(Map.of("value", 1), Map.of("value", 2))).entry("item.value", 3).entry("other", "z")
+        );
 
         assertThat(load(UnmappedFieldsPattern.ALL, """
             { "item": [ { "extra": "x" } ], "item.extra": "y" }"""), nullValue());
@@ -266,7 +273,7 @@ public class UnmappedFieldsPatternLoadingTests extends MapperServiceTestCase {
     public void testNothingBelowAMappedFieldIsLoaded() throws IOException {
         Map<String, Object> filtered = load(UnmappedFieldsPattern.ALL, """
             { "span": { "gte": 1, "lt": 5 }, "labels": { "env": "prod" }, "other": { "gte": 1 } }""");
-        assertMap(filtered, matchesMap().entry("other.gte", 1));
+        assertMap(filtered, matchesMap().entry("other", Map.of("gte", 1)));
 
         // A key spelled with dots is the same path.
         filtered = load(UnmappedFieldsPattern.ALL, """

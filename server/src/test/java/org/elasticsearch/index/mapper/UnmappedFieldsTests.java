@@ -14,6 +14,7 @@ import org.elasticsearch.common.breaker.CircuitBreaker;
 import org.elasticsearch.common.bytes.BytesArray;
 import org.elasticsearch.common.unit.ByteSizeValue;
 import org.elasticsearch.common.xcontent.XContentHelper;
+import org.elasticsearch.core.Nullable;
 import org.elasticsearch.index.mapper.blockloader.ConstantNull;
 import org.elasticsearch.search.lookup.Source;
 import org.elasticsearch.xcontent.XContentType;
@@ -291,35 +292,39 @@ public class UnmappedFieldsTests extends MapperServiceTestCase {
     }
 
     /**
-     * A leaf is handed over where the filter accepts its path, and an object is entered where the filter may accept
-     * something below it. A null is never handed over.
+     * A leaf is kept where the filter accepts its path, and an object is entered where the filter may accept something
+     * below it. A null is never kept.
      */
     public void testFilterDecidesWhatIsWalked() throws IOException {
         MapperService mapperService = createMapperService(topMapping(b -> b.field("dynamic", false)));
-        Map<String, Object> source = XContentHelper.convertToMap(JsonXContent.jsonXContent, """
+        String json = """
             {
               "a": 1,
               "b": { "c": 2, "d": { "e": 3 } },
               "f": [ 4, null, [ 5 ], { "g": 6 } ],
               "h": null,
-              "i": { "j": 7 }
-            }""", true);
+              "i": { "j": 7 },
+              "k": { "l": [ 8, { "m": 9 } ] }
+            }""";
+        Map<String, Object> source = XContentHelper.convertToMap(JsonXContent.jsonXContent, json, true);
         List<String> entered = new ArrayList<>();
-        Map<String, List<Object>> leaves = new LinkedHashMap<>();
         UnmappedFields.Filter filter = UnmappedFields.Filter.of(path -> path.equals("b.d.e") == false, path -> {
             entered.add(path);
             return path.equals("i") == false;
         });
-        createSearchExecutionContext(mapperService).unmappedFields()
-            .forEachLeaf(source, filter, (path, value) -> leaves.computeIfAbsent(path, p -> new ArrayList<>()).add(value));
-        assertThat(new ArrayList<>(leaves.keySet()), equalTo(List.of("a", "b.c", "f", "f.g")));
+        Map<String, Object> extracted = createSearchExecutionContext(mapperService).unmappedFields().extract(source, filter);
+        Map<String, List<Object>> leaves = leaves(extracted);
+        assertThat(new ArrayList<>(leaves.keySet()), equalTo(List.of("a", "b.c", "f", "f.g", "k.l", "k.l.m")));
         assertThat(leaves.get("f"), equalTo(List.of(4, 5)));
-        assertThat(entered, equalTo(List.of("b", "b.d", "f", "i")));
+        assertThat(entered, equalTo(List.of("b", "b.d", "f", "i", "k", "k.l")));
+        // What is kept whole is not copied, and what is not is left as it was.
+        assertThat(extracted.get("k"), sameInstance(source.get("k")));
+        assertThat(source, equalTo(XContentHelper.convertToMap(JsonXContent.jsonXContent, json, true)));
     }
 
     /**
-     * The loader of all unmapped fields emits one JSON object a document, keyed by path, and null for a document without
-     * any.
+     * The loader of all unmapped fields emits one JSON object a document, holding the objects and arrays that lead to
+     * them, and null for a document without any.
      */
     public void testAllFieldsLoader() throws IOException {
         MapperService mapperService = createMapperService(topMapping(b -> {
@@ -348,7 +353,7 @@ public class UnmappedFieldsTests extends MapperServiceTestCase {
             TestBlock block = (TestBlock) builder.build();
             assertThat(
                 XContentHelper.convertToMap(JsonXContent.jsonXContent, ((BytesRef) block.get(0)).utf8ToString(), true),
-                equalTo(Map.of("one", 1, "many", "a", "many.deep", true, "obj.x", 1.5))
+                equalTo(Map.of("one", 1, "many", List.of("a", Map.of("deep", true)), "obj", Map.of("x", 1.5)))
             );
             assertThat(block.get(1), nullValue());
             assertThat(block.get(2), nullValue());
@@ -406,10 +411,8 @@ public class UnmappedFieldsTests extends MapperServiceTestCase {
             Map<String, Object> source = randomObject(keys, 0);
             Source parsed = Source.fromMap(source, XContentType.JSON);
             Map<String, List<String>> walked = new HashMap<>();
-            unmappedFields.forEachLeaf(
-                source,
-                UnmappedFields.Filter.of(path -> true, path -> true),
-                (path, value) -> walked.computeIfAbsent(path, p -> new ArrayList<>()).add(value.toString())
+            leaves(unmappedFields.extract(source, UnmappedFields.Filter.of(path -> true, path -> true))).forEach(
+                (path, values) -> walked.put(path, values.stream().map(Object::toString).toList())
             );
             Set<String> names = new HashSet<>(walked.keySet());
             for (int i = 0; i < 20; i++) {
@@ -470,14 +473,33 @@ public class UnmappedFieldsTests extends MapperServiceTestCase {
     /** The unmapped leaves of a document, by path. */
     private Map<String, List<Object>> leaves(MapperService mapperService, String json) {
         Map<String, Object> source = XContentHelper.convertToMap(JsonXContent.jsonXContent, json, true);
+        return leaves(
+            createSearchExecutionContext(mapperService).unmappedFields()
+                .extract(source, UnmappedFields.Filter.of(path -> true, path -> true))
+        );
+    }
+
+    /** The values that {@code extracted} holds for each unmapped field, by path. Nothing in it may be null or empty. */
+    private static Map<String, List<Object>> leaves(@Nullable Map<String, Object> extracted) {
         Map<String, List<Object>> leaves = new LinkedHashMap<>();
-        createSearchExecutionContext(mapperService).unmappedFields()
-            .forEachLeaf(
-                source,
-                UnmappedFields.Filter.of(path -> true, path -> true),
-                (path, value) -> leaves.computeIfAbsent(path, p -> new ArrayList<>()).add(value)
-            );
+        if (extracted != null) {
+            assertFalse(extracted.isEmpty());
+            extracted.forEach((key, value) -> collectLeaves(key, value, leaves));
+        }
         return leaves;
+    }
+
+    private static void collectLeaves(String path, Object value, Map<String, List<Object>> leaves) {
+        if (value instanceof Map<?, ?> object) {
+            assertFalse(path, object.isEmpty());
+            object.forEach((key, child) -> collectLeaves(path + "." + key, child, leaves));
+        } else if (value instanceof List<?> elements) {
+            assertFalse(path, elements.isEmpty());
+            elements.forEach(element -> collectLeaves(path, element, leaves));
+        } else {
+            assertNotNull(path, value);
+            leaves.computeIfAbsent(path, p -> new ArrayList<>()).add(value);
+        }
     }
 
     /**

@@ -30,7 +30,6 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
-import java.util.function.BiConsumer;
 import java.util.function.Predicate;
 
 /**
@@ -114,15 +113,16 @@ public final class UnmappedFields {
 
     /**
      * Whether {@code name}, which this shard does not map, may be an unmapped field of one of its documents. It decides as
-     * {@link #forEachLeaf} does, so that a field is found by name exactly where a walk finds it.
+     * {@link #extract} does, so that a field is found by name exactly where it is found in {@code _source}.
      */
     public boolean mayExist(String name) {
         return skipped("", name) == false && mayExist();
     }
 
     /**
-     * Walks {@code source} and hands every unmapped leaf that {@code filter} is interested in to {@code consumer}, with its
-     * dotted path and its value, in the order {@code source} holds them. A {@code null} is not a value, wherever it is.
+     * The part of {@code source} that holds the unmapped fields {@code filter} is interested in: its objects and arrays
+     * without what is not such a field, without any {@code null} and without anything that is left empty, or {@code null}
+     * if nothing is left. What is kept whole is returned as is rather than copied, so the result must not be modified.
      * <p>
      * A path that resolves to a field of this shard is not an unmapped field. Neither are the keys of a field whose type
      * takes an object as its value, such as a range: they are part of that value. A path below a field of any other type
@@ -131,8 +131,9 @@ public final class UnmappedFields {
      * A {@code nested} object is walked like any array of objects: a field its mapping does not declare is an unmapped
      * field that holds the values of all of the nested objects.
      */
-    void forEachLeaf(Map<String, Object> source, Filter filter, BiConsumer<String, Object> consumer) {
-        walkObject(source, "", filter, consumer);
+    @Nullable
+    Map<String, Object> extract(Map<String, Object> source, Filter filter) {
+        return extractObject(source, "", filter);
     }
 
     /**
@@ -156,47 +157,76 @@ public final class UnmappedFields {
         return skipped(prefix + key);
     }
 
-    private void walkObject(Map<String, Object> object, String prefix, Filter filter, BiConsumer<String, Object> consumer) {
+    @Nullable
+    private Map<String, Object> extractObject(Map<String, Object> object, String prefix, Filter filter) {
+        // Stays null for as long as every entry is kept whole, in which case the object itself is the result.
+        Map<String, Object> copy = null;
+        int keptWhole = 0;
         for (Map.Entry<String, Object> entry : object.entrySet()) {
-            if (skipped(prefix, entry.getKey())) {
-                continue;
-            }
-            String path = prefix + entry.getKey();
             Object value = entry.getValue();
-            if (value instanceof Map<?, ?> child) {
-                walkBelow(child, path, filter, consumer);
-            } else if (value instanceof List<?> elements) {
-                walkArray(elements, path, filter, consumer);
-            } else {
-                leaf(path, value, filter, consumer);
+            Object kept = skipped(prefix, entry.getKey()) ? null : extractValue(value, prefix + entry.getKey(), filter);
+            if (copy == null) {
+                if (kept != null && kept == value) {
+                    keptWhole++;
+                    continue;
+                }
+                copy = new LinkedHashMap<>();
+                for (Map.Entry<String, Object> whole : object.entrySet()) {
+                    if (copy.size() == keptWhole) {
+                        break;
+                    }
+                    copy.put(whole.getKey(), whole.getValue());
+                }
+            }
+            if (kept != null) {
+                copy.put(entry.getKey(), kept);
             }
         }
+        if (copy == null) {
+            return object.isEmpty() ? null : object;
+        }
+        return copy.isEmpty() ? null : copy;
     }
 
-    private void walkArray(List<?> elements, String path, Filter filter, BiConsumer<String, Object> consumer) {
+    @Nullable
+    private List<?> extractArray(List<?> elements, String path, Filter filter) {
+        // Stays null for as long as every element is kept whole, in which case the array itself is the result.
+        List<Object> copy = null;
+        int keptWhole = 0;
         for (Object element : elements) {
-            if (element instanceof Map<?, ?> child) {
-                walkBelow(child, path, filter, consumer);
-            } else if (element instanceof List<?> nested) {
-                walkArray(nested, path, filter, consumer);
-            } else {
-                leaf(path, element, filter, consumer);
+            Object kept = extractValue(element, path, filter);
+            if (copy == null) {
+                if (kept != null && kept == element) {
+                    keptWhole++;
+                    continue;
+                }
+                copy = new ArrayList<>(elements.subList(0, keptWhole));
+            }
+            if (kept != null) {
+                copy.add(kept);
             }
         }
+        if (copy == null) {
+            return elements.isEmpty() ? null : elements;
+        }
+        return copy.isEmpty() ? null : copy;
     }
 
+    /**
+     * What is kept of {@code value}, found at {@code path}: an object or an array is reduced to the unmapped fields below
+     * it, and anything else is a value of the field {@code path}.
+     */
+    @Nullable
     @SuppressWarnings("unchecked") // an object of _source is keyed by field name
-    private void walkBelow(Map<?, ?> object, String path, Filter filter, BiConsumer<String, Object> consumer) {
-        if (filter.mayAcceptBelow(path)) {
-            walkObject((Map<String, Object>) object, path + ".", filter, consumer);
+    private Object extractValue(@Nullable Object value, String path, Filter filter) {
+        if (value instanceof Map<?, ?> child) {
+            return filter.mayAcceptBelow(path) ? extractObject((Map<String, Object>) child, path + ".", filter) : null;
         }
-    }
-
-    private void leaf(String path, @Nullable Object value, Filter filter, BiConsumer<String, Object> consumer) {
+        if (value instanceof List<?> elements) {
+            return extractArray(elements, path, filter);
+        }
         // A name that resolves without a mapper of its own, such as a runtime field, is a field of the shard all the same.
-        if (value != null && filter.accepts(path) && mappingLookup.getFieldType(path) == null) {
-            consumer.accept(path, value);
-        }
+        return value != null && filter.accepts(path) && mappingLookup.getFieldType(path) == null ? value : null;
     }
 
     /**
@@ -229,9 +259,9 @@ public final class UnmappedFields {
     }
 
     /**
-     * Loads, for each document, the unmapped fields that {@code filter} is interested in as one JSON object, keyed by the
-     * dotted path of each field and holding the value, or the array of values, {@code _source} has for it. A document without
-     * any loads as {@code null}. Loads nothing where {@link #mayExist()} rules it out.
+     * Loads, for each document, the unmapped fields that {@code filter} is interested in as one JSON object: the objects
+     * and arrays of {@code _source} that lead to them, as {@link #extract} leaves them. A document without any loads as
+     * {@code null}. Loads nothing where {@link #mayExist()} rules it out.
      *
      * @param sourceReservationFactor how many times the size of a serialized {@code _source} to reserve while it is parsed
      */
@@ -333,8 +363,6 @@ public final class UnmappedFields {
         @Override
         public RowStrideReader rowStrideReader(CircuitBreaker breaker, LeafReaderContext context) {
             return new BlockStoredFieldsReader(breaker) {
-                private final Map<String, List<Object>> leaves = new LinkedHashMap<>();
-
                 @Override
                 public void read(int docId, StoredFields storedFields, Builder builder) throws IOException {
                     Source source = storedFields.source();
@@ -342,23 +370,13 @@ public final class UnmappedFields {
                     long reservation = (long) (source.internalSourceRef().length() * sourceReservationFactor);
                     breaker.addEstimateBytesAndMaybeBreak(reservation, "unmapped fields source");
                     try {
-                        leaves.clear();
-                        unmappedFields.forEachLeaf(
-                            source.source(),
-                            filter,
-                            (path, value) -> leaves.computeIfAbsent(path, p -> new ArrayList<>(1)).add(value)
-                        );
-                        if (leaves.isEmpty()) {
+                        Map<String, Object> unmapped = unmappedFields.extract(source.source(), filter);
+                        if (unmapped == null) {
                             builder.appendNull();
                             return;
                         }
                         try (XContentBuilder json = XContentFactory.jsonBuilder()) {
-                            json.startObject();
-                            for (Map.Entry<String, List<Object>> leaf : leaves.entrySet()) {
-                                List<Object> values = leaf.getValue();
-                                json.field(leaf.getKey(), values.size() == 1 ? values.get(0) : values);
-                            }
-                            json.endObject();
+                            json.map(unmapped);
                             ((BytesRefBuilder) builder).appendBytesRef(BytesReference.bytes(json).toBytesRef());
                         }
                     } finally {
