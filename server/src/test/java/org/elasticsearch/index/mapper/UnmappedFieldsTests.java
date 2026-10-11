@@ -23,9 +23,11 @@ import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 import static org.hamcrest.Matchers.containsInAnyOrder;
 import static org.hamcrest.Matchers.equalTo;
@@ -286,6 +288,183 @@ public class UnmappedFieldsTests extends MapperServiceTestCase {
         UnmappedFields unmappedFields = createSearchExecutionContext(inner).unmappedFields();
         assertTrue(unmappedFields.mayExist("plain.below"));
         assertThat(unmappedFields.blockLoader("plain.below"), hasToString("UnmappedFields.Named[plain.below]"));
+    }
+
+    /**
+     * A leaf is handed over where the filter accepts its path, and an object is entered where the filter may accept
+     * something below it. A null is never handed over.
+     */
+    public void testFilterDecidesWhatIsWalked() throws IOException {
+        MapperService mapperService = createMapperService(topMapping(b -> b.field("dynamic", false)));
+        Map<String, Object> source = XContentHelper.convertToMap(JsonXContent.jsonXContent, """
+            {
+              "a": 1,
+              "b": { "c": 2, "d": { "e": 3 } },
+              "f": [ 4, null, [ 5 ], { "g": 6 } ],
+              "h": null,
+              "i": { "j": 7 }
+            }""", true);
+        List<String> entered = new ArrayList<>();
+        Map<String, List<Object>> leaves = new LinkedHashMap<>();
+        UnmappedFields.Filter filter = UnmappedFields.Filter.of(path -> path.equals("b.d.e") == false, path -> {
+            entered.add(path);
+            return path.equals("i") == false;
+        });
+        createSearchExecutionContext(mapperService).unmappedFields()
+            .forEachLeaf(source, filter, (path, value) -> leaves.computeIfAbsent(path, p -> new ArrayList<>()).add(value));
+        assertThat(new ArrayList<>(leaves.keySet()), equalTo(List.of("a", "b.c", "f", "f.g")));
+        assertThat(leaves.get("f"), equalTo(List.of(4, 5)));
+        assertThat(entered, equalTo(List.of("b", "b.d", "f", "i")));
+    }
+
+    /**
+     * The loader of all unmapped fields emits one JSON object a document, keyed by path, and null for a document without
+     * any.
+     */
+    public void testAllFieldsLoader() throws IOException {
+        MapperService mapperService = createMapperService(topMapping(b -> {
+            b.field("dynamic", false);
+            b.startObject("properties").startObject("mapped").field("type", "keyword").endObject().endObject();
+        }));
+        BlockLoader loader = createSearchExecutionContext(mapperService).unmappedFields()
+            .blockLoader(UnmappedFields.Filter.of(path -> path.startsWith("skip") == false, path -> true), 2.0);
+        assertThat(loader, hasToString("UnmappedFields.All"));
+        assertTrue(loader.rowStrideStoredFieldSpec().requiresSource());
+        assertFalse(loader.supportsOrdinals());
+        assertThat(loader.columnAtATimeReader(null), nullValue());
+
+        CircuitBreaker breaker = newLimitedBreaker(ByteSizeValue.ofMb(1));
+        try (BlockLoader.RowStrideReader reader = loader.rowStrideReader(breaker, null)) {
+            assertThat(reader, hasToString("UnmappedFields.All.Reader"));
+            long inherited = breaker.getUsed();
+            BlockLoader.Builder builder = loader.builder(TestBlock.factory(), 3);
+            reader.read(0, storedFields(json("""
+                { "mapped": "m", "one": 1, "many": [ "a", null, { "deep": true } ], "obj": { "x": 1.5 }, "skipped": 2 }""")), builder);
+            reader.read(1, storedFields(json("""
+                { "mapped": "m", "skipped": 2, "empty": [], "nulls": [ null ], "none": null }""")), builder);
+            reader.read(2, storedFields(json("{}")), builder);
+            assertThat(breaker.getUsed(), equalTo(inherited));
+
+            TestBlock block = (TestBlock) builder.build();
+            assertThat(
+                XContentHelper.convertToMap(JsonXContent.jsonXContent, ((BytesRef) block.get(0)).utf8ToString(), true),
+                equalTo(Map.of("one", 1, "many", "a", "many.deep", true, "obj.x", 1.5))
+            );
+            assertThat(block.get(1), nullValue());
+            assertThat(block.get(2), nullValue());
+        }
+        assertThat(breaker.getUsed(), equalTo(0L));
+    }
+
+    /**
+     * Whatever a walk finds is found by name with the same values, and a name a walk does not find reads as null, over
+     * documents that put every shape of value at paths that are mapped, below a mapped path, and neither.
+     */
+    public void testNamingAFieldFindsWhatAWalkFinds() throws IOException {
+        MapperService mapperService = createMapperService(topMapping(b -> {
+            b.field("dynamic", false);
+            b.startObject("runtime").startObject("rt").field("type", "keyword").endObject().endObject();
+            b.startObject("properties");
+            b.startObject("kw").field("type", "keyword").endObject();
+            b.startObject("al").field("type", "alias").field("path", "kw").endObject();
+            b.startObject("span").field("type", "integer_range").endObject();
+            b.startObject("labels").field("type", "flattened").endObject();
+            b.startObject("item").field("type", "nested").startObject("properties");
+            b.startObject("declared").field("type", "keyword").endObject();
+            b.endObject().endObject();
+            b.startObject("obj").startObject("properties");
+            b.startObject("kw").field("type", "keyword").endObject();
+            b.startObject("point").field("type", "geo_point").endObject();
+            b.endObject().endObject();
+            b.startObject("off").field("type", "object").field("enabled", false).endObject();
+            b.endObject();
+        }));
+        List<String> keys = List.of(
+            "kw",
+            "al",
+            "rt",
+            "span",
+            "labels",
+            "item",
+            "obj",
+            "off",
+            "declared",
+            "point",
+            "gte",
+            "x",
+            "y",
+            "x.y",
+            "obj.kw",
+            "obj.x",
+            "item.x",
+            "kw.x",
+            "span.gte",
+            "labels.x"
+        );
+        UnmappedFields unmappedFields = createSearchExecutionContext(mapperService).unmappedFields();
+        for (int iteration = 0; iteration < 200; iteration++) {
+            Map<String, Object> source = randomObject(keys, 0);
+            Source parsed = Source.fromMap(source, XContentType.JSON);
+            Map<String, List<String>> walked = new HashMap<>();
+            unmappedFields.forEachLeaf(
+                source,
+                UnmappedFields.Filter.of(path -> true, path -> true),
+                (path, value) -> walked.computeIfAbsent(path, p -> new ArrayList<>()).add(value.toString())
+            );
+            Set<String> names = new HashSet<>(walked.keySet());
+            for (int i = 0; i < 20; i++) {
+                names.add(String.join(".", randomList(1, 3, () -> randomFrom(keys))));
+            }
+            for (String name : names) {
+                if (mapperService.mappingLookup().getFieldType(name) != null) {
+                    assertThat(name + " in " + source, walked.get(name), nullValue());
+                    continue;
+                }
+                List<String> expected = walked.getOrDefault(name, List.of());
+                assertThat(name + " in " + source, unmappedFields.mayExist(name) || expected.isEmpty(), equalTo(true));
+                BlockLoader loader = unmappedFields.blockLoader(name);
+                List<String> named = new ArrayList<>();
+                if (loader == ConstantNull.INSTANCE) {
+                    assertThat(name + " in " + source, expected, equalTo(List.of()));
+                    continue;
+                }
+                try (BlockLoader.RowStrideReader reader = loader.rowStrideReader(newLimitedBreaker(ByteSizeValue.ofMb(1)), null)) {
+                    BlockLoader.Builder builder = loader.builder(TestBlock.factory(), 1);
+                    reader.read(0, storedFields(parsed), builder);
+                    Object value = asValue(((TestBlock) builder.build()).get(0));
+                    if (value instanceof List<?> list) {
+                        list.forEach(v -> named.add((String) v));
+                    } else if (value != null) {
+                        named.add((String) value);
+                    }
+                }
+                assertThat(name + " in " + source, named, containsInAnyOrder(expected.toArray()));
+            }
+        }
+    }
+
+    private static Map<String, Object> randomObject(List<String> keys, int depth) {
+        Map<String, Object> object = new LinkedHashMap<>();
+        for (int i = between(1, 4); i > 0; i--) {
+            object.put(randomFrom(keys), randomValue(keys, depth));
+        }
+        return object;
+    }
+
+    private static Object randomValue(List<String> keys, int depth) {
+        return switch (between(0, depth < 3 ? 5 : 3)) {
+            case 0 -> randomAlphaOfLength(3);
+            case 1 -> between(0, 9);
+            case 2 -> randomBoolean();
+            case 3 -> null;
+            case 4 -> randomObject(keys, depth + 1);
+            case 5 -> randomList(0, 3, () -> randomValue(keys, depth + 1));
+            default -> throw new AssertionError();
+        };
+    }
+
+    private static Source json(String json) {
+        return Source.fromBytes(new BytesArray(json), XContentType.JSON);
     }
 
     /** The unmapped leaves of a document, by path. */
