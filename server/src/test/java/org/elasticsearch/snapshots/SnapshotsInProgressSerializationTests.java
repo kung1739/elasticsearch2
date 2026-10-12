@@ -25,11 +25,13 @@ import org.elasticsearch.cluster.metadata.ProjectId;
 import org.elasticsearch.cluster.metadata.SingleNodeShutdownMetadata;
 import org.elasticsearch.cluster.version.CompatibilityVersions;
 import org.elasticsearch.common.Strings;
+import org.elasticsearch.common.bytes.BytesArray;
 import org.elasticsearch.common.io.stream.BytesStreamOutput;
 import org.elasticsearch.common.io.stream.NamedWriteableRegistry;
 import org.elasticsearch.common.io.stream.Writeable;
 import org.elasticsearch.common.unit.ByteSizeValue;
 import org.elasticsearch.common.xcontent.XContentHelper;
+import org.elasticsearch.core.Nullable;
 import org.elasticsearch.index.Index;
 import org.elasticsearch.index.IndexVersion;
 import org.elasticsearch.index.shard.ShardId;
@@ -92,7 +94,7 @@ public class SnapshotsInProgressSerializationTests extends SimpleDiffableWireSer
         final var oldVersion = TransportVersionUtils.getPreviousVersion(PROJECT_ID_IN_SNAPSHOT);
         final BytesStreamOutput out = new BytesStreamOutput();
         out.setTransportVersion(oldVersion);
-        final Custom original = createTestInstance(() -> randomSnapshot(ProjectId.DEFAULT));
+        final Custom original = createTestInstance(() -> randomSnapshot(ProjectId.DEFAULT, null));
         original.writeTo(out);
 
         final var in = out.bytes().streamInput();
@@ -106,8 +108,8 @@ public class SnapshotsInProgressSerializationTests extends SimpleDiffableWireSer
         final BytesStreamOutput out = new BytesStreamOutput();
         out.setTransportVersion(oldVersion);
 
-        final Custom before = createTestInstance(() -> randomSnapshot(ProjectId.DEFAULT));
-        final Custom after = makeTestChanges(before, () -> randomSnapshot(ProjectId.DEFAULT));
+        final Custom before = createTestInstance(() -> randomSnapshot(ProjectId.DEFAULT, null));
+        final Custom after = makeTestChanges(before, () -> randomSnapshot(ProjectId.DEFAULT, null));
         final Diff<Custom> diff = after.diff(before);
         diff.writeTo(out);
 
@@ -116,6 +118,38 @@ public class SnapshotsInProgressSerializationTests extends SimpleDiffableWireSer
         final NamedDiff<Custom> diffFromStream = SnapshotsInProgress.readDiffFrom(in);
 
         assertThat(diffFromStream.apply(before), equalTo(after));
+    }
+
+    public void testEncryptedDataKeyDroppedForOlderVersions() throws IOException {
+        final var oldVersion = TransportVersionUtils.getPreviousVersion(SnapshotEncryptedData.TRANSPORT_VERSION);
+        final Entry withKey = randomSnapshot(randomProjectIdOrDefault(), randomEncryptedDataKey());
+        final BytesStreamOutput out = new BytesStreamOutput();
+        out.setTransportVersion(oldVersion);
+        SnapshotsInProgress.EMPTY.withAddedEntry(withKey).writeTo(out);
+
+        final var in = out.bytes().streamInput();
+        in.setTransportVersion(oldVersion);
+        final Entry fromStream = new SnapshotsInProgress(in).asStream().findFirst().orElseThrow();
+        assertNull(fromStream.encryptedDataKey());
+        assertThat(fromStream, equalTo(withoutEncryptedDataKey(withKey)));
+    }
+
+    private static Entry withoutEncryptedDataKey(Entry entry) {
+        return Entry.snapshot(
+            entry.snapshot(),
+            entry.includeGlobalState(),
+            entry.partial(),
+            entry.state(),
+            entry.indices(),
+            entry.dataStreams(),
+            entry.featureStates(),
+            entry.startTime(),
+            entry.repositoryStateId(),
+            entry.shards(),
+            entry.failure(),
+            entry.userMetadata(),
+            entry.version()
+        );
     }
 
     private ClusterState getClusterStateWithNodeShutdownMetadata(List<String> nodeIdsForRemoval) {
@@ -146,6 +180,10 @@ public class SnapshotsInProgressSerializationTests extends SimpleDiffableWireSer
     }
 
     private Entry randomSnapshot(ProjectId projectId) {
+        return randomSnapshot(projectId, randomBoolean() ? null : randomEncryptedDataKey());
+    }
+
+    private Entry randomSnapshot(ProjectId projectId, @Nullable SnapshotEncryptedDataKey encryptedDataKey) {
         Snapshot snapshot = new Snapshot(
             projectId,
             "repo-" + randomInt(5),
@@ -184,7 +222,16 @@ public class SnapshotsInProgressSerializationTests extends SimpleDiffableWireSer
             shards,
             null,
             SnapshotInfoTestUtils.randomUserMetadata(),
-            IndexVersionUtils.randomVersion()
+            IndexVersionUtils.randomVersion(),
+            encryptedDataKey
+        );
+    }
+
+    private static SnapshotEncryptedDataKey randomEncryptedDataKey() {
+        return new SnapshotEncryptedDataKey(
+            SnapshotEncryptedData.TYPE_PASSWORD,
+            randomBoolean() ? null : randomAlphaOfLength(8),
+            new BytesArray(randomByteArrayOfLength(between(1, 64)))
         );
     }
 
@@ -302,7 +349,7 @@ public class SnapshotsInProgressSerializationTests extends SimpleDiffableWireSer
     }
 
     private Entry mutateEntry(Entry entry) {
-        switch (randomInt(5)) {
+        switch (randomInt(6)) {
             case 0 -> {
                 boolean includeGlobalState = entry.includeGlobalState() == false;
                 return Entry.snapshot(
@@ -318,7 +365,8 @@ public class SnapshotsInProgressSerializationTests extends SimpleDiffableWireSer
                     entry.shards(),
                     entry.failure(),
                     entry.userMetadata(),
-                    entry.version()
+                    entry.version(),
+                    entry.encryptedDataKey()
                 );
             }
             case 1 -> {
@@ -336,7 +384,8 @@ public class SnapshotsInProgressSerializationTests extends SimpleDiffableWireSer
                     entry.shards(),
                     entry.failure(),
                     entry.userMetadata(),
-                    entry.version()
+                    entry.version(),
+                    entry.encryptedDataKey()
                 );
             }
             case 2 -> {
@@ -354,7 +403,8 @@ public class SnapshotsInProgressSerializationTests extends SimpleDiffableWireSer
                     entry.shards(),
                     entry.failure(),
                     entry.userMetadata(),
-                    entry.version()
+                    entry.version(),
+                    entry.encryptedDataKey()
                 );
             }
             case 3 -> {
@@ -378,7 +428,8 @@ public class SnapshotsInProgressSerializationTests extends SimpleDiffableWireSer
                     entry.shards(),
                     entry.failure(),
                     userMetadata,
-                    entry.version()
+                    entry.version(),
+                    entry.encryptedDataKey()
                 );
             }
             case 4 -> {
@@ -400,11 +451,30 @@ public class SnapshotsInProgressSerializationTests extends SimpleDiffableWireSer
                     entry.shards(),
                     entry.failure(),
                     entry.userMetadata(),
-                    entry.version()
+                    entry.version(),
+                    entry.encryptedDataKey()
                 );
             }
             case 5 -> {
                 return mutateEntryWithLegalChange(entry);
+            }
+            case 6 -> {
+                return Entry.snapshot(
+                    entry.snapshot(),
+                    entry.includeGlobalState(),
+                    entry.partial(),
+                    entry.state(),
+                    entry.indices(),
+                    entry.dataStreams(),
+                    entry.featureStates(),
+                    entry.startTime(),
+                    entry.repositoryStateId(),
+                    entry.shards(),
+                    entry.failure(),
+                    entry.userMetadata(),
+                    entry.version(),
+                    randomValueOtherThan(entry.encryptedDataKey(), () -> randomBoolean() ? null : randomEncryptedDataKey())
+                );
             }
             default -> throw new IllegalArgumentException("invalid randomization case");
         }
@@ -428,7 +498,8 @@ public class SnapshotsInProgressSerializationTests extends SimpleDiffableWireSer
                     entry.shards(),
                     entry.failure(),
                     entry.userMetadata(),
-                    entry.version()
+                    entry.version(),
+                    entry.encryptedDataKey()
                 );
             }
             case 1 -> {
@@ -446,7 +517,8 @@ public class SnapshotsInProgressSerializationTests extends SimpleDiffableWireSer
                     entry.shards(),
                     entry.failure(),
                     entry.userMetadata(),
-                    entry.version()
+                    entry.version(),
+                    entry.encryptedDataKey()
                 );
             }
             case 2 -> {
@@ -464,7 +536,8 @@ public class SnapshotsInProgressSerializationTests extends SimpleDiffableWireSer
                     entry.shards(),
                     failure,
                     entry.userMetadata(),
-                    entry.version()
+                    entry.version(),
+                    entry.encryptedDataKey()
                 );
             }
             case 3 -> {
@@ -490,7 +563,8 @@ public class SnapshotsInProgressSerializationTests extends SimpleDiffableWireSer
                     shards,
                     entry.failure(),
                     entry.userMetadata(),
-                    entry.version()
+                    entry.version(),
+                    entry.encryptedDataKey()
                 );
             }
             default -> throw new IllegalArgumentException("invalid randomization case");

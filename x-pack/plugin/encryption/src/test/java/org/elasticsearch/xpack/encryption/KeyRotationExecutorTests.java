@@ -8,14 +8,24 @@ package org.elasticsearch.xpack.encryption;
 
 import org.elasticsearch.cluster.ClusterName;
 import org.elasticsearch.cluster.ClusterState;
+import org.elasticsearch.cluster.SnapshotsInProgress;
 import org.elasticsearch.cluster.metadata.Metadata;
 import org.elasticsearch.cluster.metadata.ProjectMetadata;
 import org.elasticsearch.cluster.project.DefaultProjectResolver;
+import org.elasticsearch.common.io.stream.BytesStreamOutput;
 import org.elasticsearch.core.Tuple;
+import org.elasticsearch.index.IndexVersion;
+import org.elasticsearch.snapshots.Snapshot;
+import org.elasticsearch.snapshots.SnapshotEncryptedData;
+import org.elasticsearch.snapshots.SnapshotEncryptedDataKey;
+import org.elasticsearch.snapshots.SnapshotId;
 import org.elasticsearch.test.ESTestCase;
 import org.elasticsearch.xpack.encryption.ProjectEncryptionKeyMetadata.KeyEntry;
+import org.elasticsearch.xpack.encryption.spi.EncryptedData;
 
+import java.io.IOException;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -46,6 +56,27 @@ public class KeyRotationExecutorTests extends ESTestCase {
             project.putCustom(ProjectEncryptionKeyMetadata.TYPE, metadata);
         }
         return ClusterState.builder(CLUSTER_NAME).metadata(Metadata.builder().put(project.build()).build()).build();
+    }
+
+    /** Adds an in-progress snapshot whose sealed {@code encrypted_data} key is encrypted under {@code keyId}. */
+    static ClusterState withSnapshotSealedUnder(ClusterState state, String keyId) throws IOException {
+        BytesStreamOutput sealed = new BytesStreamOutput();
+        new EncryptedData(keyId, new byte[] { 1 }).writeTo(sealed);
+        SnapshotsInProgress.Entry entry = SnapshotsInProgress.startedEntry(
+            new Snapshot(Metadata.DEFAULT_PROJECT_ID, "repo", new SnapshotId("snap", "uuid")),
+            true,
+            false,
+            Map.of(),
+            List.of(),
+            0L,
+            0L,
+            Map.of(),
+            Map.of(),
+            IndexVersion.current(),
+            List.of(),
+            new SnapshotEncryptedDataKey(SnapshotEncryptedData.TYPE_PASSWORD, null, sealed.bytes())
+        );
+        return ClusterState.builder(state).putCustom(SnapshotsInProgress.TYPE, SnapshotsInProgress.EMPTY.withAddedEntry(entry)).build();
     }
 
     private static ProjectEncryptionKeyMetadata metadataOf(ClusterState state) {
@@ -181,6 +212,25 @@ public class KeyRotationExecutorTests extends ESTestCase {
         ProjectEncryptionKeyMetadata metadata = metadataOf(result.v1());
         assertEquals("only 'old' should have been retired", Set.of("active", "recent"), metadata.getKeys().keySet());
         assertEquals("active", metadata.getActiveKeyId());
+    }
+
+    public void testRetireKeysKeepsKeySealingInProgressSnapshot() throws IOException {
+        Map<String, KeyEntry> entries = new HashMap<>();
+        entries.put("old", entry(100L));
+        entries.put("sealing", entry(100L));
+        entries.put("active", entry(500L));
+        ProjectEncryptionKeyMetadata existing = new ProjectEncryptionKeyMetadata(
+            entries,
+            "active",
+            PASSWORD_ID,
+            Map.of(),
+            NO_OP_ENCRYPTION
+        );
+        ClusterState state = withSnapshotSealedUnder(stateWith(existing), "sealing");
+
+        Tuple<ClusterState, Void> result = executor.executeTask(new KeyRotationCoordinator.RetireKeysTask(450L), state);
+
+        assertEquals(Set.of("active", "sealing"), metadataOf(result.v1()).getKeys().keySet());
     }
 
     public void testRetireKeysNeverRetiresActiveKey() {

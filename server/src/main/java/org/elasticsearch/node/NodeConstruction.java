@@ -1271,7 +1271,14 @@ class NodeConstruction {
             .stream()
             .collect(Collectors.toMap(Object::getClass, Function.identity(), (a, b) -> a, LinkedHashMap::new))
             .values();
-        snapshotsService.setSnapshotGlobalStateTransformers(List.copyOf(snapshotGlobalStateTransformers));
+        if (snapshotGlobalStateTransformers.size() > 1) {
+            throw new IllegalStateException("More than one extension found for " + SnapshotGlobalStateTransformer.class.getSimpleName());
+        }
+        snapshotsService.setSnapshotGlobalStateTransformer(
+            snapshotGlobalStateTransformers.isEmpty()
+                ? SnapshotGlobalStateTransformer.NOOP
+                : snapshotGlobalStateTransformers.iterator().next()
+        );
 
         SnapshotShardsService snapshotShardsService = new SnapshotShardsService(
             settings,

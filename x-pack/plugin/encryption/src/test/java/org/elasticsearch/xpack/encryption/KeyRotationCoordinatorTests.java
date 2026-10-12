@@ -658,6 +658,30 @@ public class KeyRotationCoordinatorTests extends ESTestCase {
         );
     }
 
+    public void testTickDoesNotSubmitRetireForKeySealingInProgressSnapshot() throws IOException {
+        TimeValue checkInterval = TimeValue.timeValueMinutes(1);
+        long now = 1_000_000L;
+        long activeGeneratedAt = now - 15 * 60 * 1000L;
+        long oldGeneratedAt = now - 30 * 60 * 1000L;
+        ProjectEncryptionKeyMetadata metadata = new ProjectEncryptionKeyMetadata(
+            Map.of("old", entry(oldGeneratedAt), "active", entry(activeGeneratedAt)),
+            "active",
+            PASSWORD_ID,
+            Map.of(),
+            NO_OP_ENCRYPTION
+        );
+        ClusterState state = KeyRotationExecutorTests.withSnapshotSealedUnder(clusterStateWith(metadata, true), "old");
+        setup(state, now, TimeValue.timeValueDays(30), checkInterval);
+
+        coordinator.tick();
+
+        verify(taskQueue, never()).submitTask(
+            eq("retire-project-encryption-keys"),
+            isA(KeyRotationCoordinator.RetireKeysTask.class),
+            any()
+        );
+    }
+
     public void testReEncryptApplyTaskUpdatesCustomAndHandlerKeyIds() throws Exception {
         long now = 100L;
         ProjectEncryptionKeyMetadata metadata = new ProjectEncryptionKeyMetadata(
