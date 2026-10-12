@@ -5885,6 +5885,81 @@ public class ParquetFormatReaderTests extends ESTestCase {
         }
     }
 
+    /**
+     * A LIST of {@code uint32} widens each element the way a scalar {@code uint32} column does — unsigned, because an
+     * unsigned 32-bit value can exceed {@code Integer.MAX_VALUE}, which is exactly why the type renders ESQL
+     * {@code long}. No declaration is involved: the element renders {@code long} from the file. The list arm appended
+     * {@code getInteger()} directly, so the two elements above 2^31 came back negative.
+     */
+    public void testListOfUnsignedInt32WidensElements() throws Exception {
+        MessageType schema = new MessageType(
+            "test_schema",
+            Types.optionalList()
+                .optionalElement(PrimitiveType.PrimitiveTypeName.INT32)
+                .as(LogicalTypeAnnotation.intType(32, false))
+                .named("ids")
+        );
+        byte[] parquetData = createParquetFile(schema, factory -> {
+            Group g = factory.newGroup();
+            Group list = g.addGroup("ids");
+            list.addGroup("list").append("element", 1);
+            list.addGroup("list").append("element", (int) 2_147_483_648L);
+            list.addGroup("list").append("element", (int) 4_000_000_000L);
+            return List.of(g);
+        });
+        assertListLongReads(parquetData, "ids", 1L, 2_147_483_648L, 4_000_000_000L);
+    }
+
+    /**
+     * The control for the arm above: {@code TIME(MILLIS)} is the other {@code INT32} annotation that renders ESQL
+     * {@code long}, and its raw millisecond-of-day value is signed, so it must widen unchanged. A fix that widens
+     * every {@code INT32} element unsigned passes the case above and fails this one.
+     */
+    public void testListOfTimeMillisWidensSigned() throws Exception {
+        MessageType schema = new MessageType(
+            "test_schema",
+            Types.optionalList()
+                .optionalElement(PrimitiveType.PrimitiveTypeName.INT32)
+                .as(LogicalTypeAnnotation.timeType(true, LogicalTypeAnnotation.TimeUnit.MILLIS))
+                .named("tods")
+        );
+        byte[] parquetData = createParquetFile(schema, factory -> {
+            Group g = factory.newGroup();
+            Group list = g.addGroup("tods");
+            list.addGroup("list").append("element", 37_230_000); // 10:20:30.000
+            list.addGroup("list").append("element", 1);
+            return List.of(g);
+        });
+        assertListLongReads(parquetData, "tods", 37_230_000L, 1L);
+    }
+
+    /**
+     * Reads a one-row LIST {@code column} as ESQL {@code long} through both decode engines and asserts the row's
+     * elements. The two engines share the list decode, so this also pins that they cannot drift apart on it.
+     */
+    private void assertListLongReads(byte[] parquetData, String column, long... expected) throws Exception {
+        StorageObject storageObject = createStorageObject(parquetData);
+        List<Attribute> asLong = List.of(new ReferenceAttribute(Source.EMPTY, column, DataType.LONG));
+        for (boolean optimized : List.of(true, false)) {
+            ParquetFormatReader r = new ParquetFormatReader(blockFactory, optimized);
+            try (
+                CloseableIterator<Page> it = r.readRange(
+                    storageObject,
+                    new RangeReadContext(List.of(column), 10, 0, parquetData.length, asLong, ErrorPolicy.STRICT)
+                )
+            ) {
+                LongBlock l = (LongBlock) it.next().getBlock(0);
+                String where = "optimized=" + optimized;
+                assertEquals(where, 1, l.getPositionCount());
+                assertEquals(where + " element count", expected.length, l.getValueCount(0));
+                int first = l.getFirstValueIndex(0);
+                for (int i = 0; i < expected.length; i++) {
+                    assertEquals(where + " element " + i, expected[i], l.getLong(first + i));
+                }
+            }
+        }
+    }
+
     /** A physical DOUBLE column read as declared {@code double} preserves non-finite IEEE values (NaN/Infinity). */
     public void testDoubleFileNonFiniteValuesPassThroughDeclared() throws Exception {
         MessageType schema = Types.buildMessage().required(PrimitiveType.PrimitiveTypeName.DOUBLE).named("d").named("test_schema");
