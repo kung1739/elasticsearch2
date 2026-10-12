@@ -146,7 +146,6 @@ import org.elasticsearch.painless.node.SReturn;
 import org.elasticsearch.painless.node.SThrow;
 import org.elasticsearch.painless.node.STry;
 import org.elasticsearch.painless.node.SWhile;
-import org.elasticsearch.painless.spi.annotation.AllocatesAnnotation;
 import org.elasticsearch.painless.spi.annotation.ScriptAwareAnnotation;
 import org.elasticsearch.painless.symbol.Decorations.AccessDepth;
 import org.elasticsearch.painless.symbol.Decorations.AllEscape;
@@ -1658,9 +1657,16 @@ public class DefaultUserTreeToIRTreePhase implements UserTreeVisitor<ScriptScope
         irFunctionNode.attachDecoration(new IRDReturnType(returnType));
         irFunctionNode.attachDecoration(new IRDTypeParameters(List.of(int.class)));
         irFunctionNode.attachDecoration(new IRDParameterNames(List.of("size")));
-        irFunctionNode.attachCondition(IRCStatic.class);
+        // Under tracking the array inside is charged, which needs the script: the method takes it as an instance capture.
+        if (scriptScope.getCompilerSettings().isAllocationTrackingEnabled()) {
+            irFunctionNode.attachCondition(IRCInstanceCapture.class);
+            irReferenceNode.attachCondition(IRCInstanceCapture.class);
+        } else {
+            irFunctionNode.attachCondition(IRCStatic.class);
+        }
         irFunctionNode.attachCondition(IRCSynthetic.class);
         irFunctionNode.attachDecoration(new IRDMaxLoopCounter(0));
+        attachAllocationLimit(irFunctionNode, scriptScope);
         irFunctionNode.setBlockNode(irBlockNode);
 
         irClassNode.addFunctionNode(irFunctionNode);
@@ -1767,6 +1773,10 @@ public class DefaultUserTreeToIRTreePhase implements UserTreeVisitor<ScriptScope
                     LoadDotDefNode irLoadDotDefNode = new LoadDotDefNode(location);
                     irLoadDotDefNode.attachDecoration(new IRDExpressionType(valueType));
                     irLoadDotDefNode.attachDecoration(new IRDValue(userDotNode.getIndex()));
+                    // Push the script when the name may resolve to a getter that needs it; the bootstrap places or drops it.
+                    if (DefaultSemanticAnalysisPhase.defGetterNeedsScript(scriptScope, userDotNode.getIndex())) {
+                        irLoadDotDefNode.attachCondition(IRCScriptAware.class);
+                    }
                     irLoadNode = irLoadDotDefNode;
                 }
 
@@ -1802,11 +1812,12 @@ public class DefaultUserTreeToIRTreePhase implements UserTreeVisitor<ScriptScope
                 }
 
                 if (write == false || compound) {
+                    PainlessMethod getter = scriptScope.getDecoration(userDotNode, GetterPainlessMethod.class).getterPainlessMethod();
                     LoadDotShortcutNode irLoadDotShortcutNode = new LoadDotShortcutNode(location);
                     irLoadDotShortcutNode.attachDecoration(new IRDExpressionType(valueType));
-                    irLoadDotShortcutNode.attachDecoration(
-                        new IRDMethod(scriptScope.getDecoration(userDotNode, GetterPainlessMethod.class).getterPainlessMethod())
-                    );
+                    irLoadDotShortcutNode.attachDecoration(new IRDMethod(getter));
+                    // A getter read through shorthand charges its @allocates estimator like a call would.
+                    attachAllocationEstimator(irLoadDotShortcutNode, scriptScope, getter);
                     irLoadNode = irLoadDotShortcutNode;
                 }
 
@@ -1856,11 +1867,11 @@ public class DefaultUserTreeToIRTreePhase implements UserTreeVisitor<ScriptScope
                 }
 
                 if (write == false || compound) {
+                    PainlessMethod getter = scriptScope.getDecoration(userDotNode, GetterPainlessMethod.class).getterPainlessMethod();
                     LoadListShortcutNode irLoadListShortcutNode = new LoadListShortcutNode(location);
                     irLoadListShortcutNode.attachDecoration(new IRDExpressionType(valueType));
-                    irLoadListShortcutNode.attachDecoration(
-                        new IRDMethod(scriptScope.getDecoration(userDotNode, GetterPainlessMethod.class).getterPainlessMethod())
-                    );
+                    irLoadListShortcutNode.attachDecoration(new IRDMethod(getter));
+                    attachAllocationEstimator(irLoadListShortcutNode, scriptScope, getter);
                     irLoadNode = irLoadListShortcutNode;
                 }
 
@@ -1939,6 +1950,10 @@ public class DefaultUserTreeToIRTreePhase implements UserTreeVisitor<ScriptScope
                 LoadBraceDefNode irLoadBraceDefNode = new LoadBraceDefNode(location);
                 irLoadBraceDefNode.attachDecoration(new IRDExpressionType(valueType));
                 irLoadBraceDefNode.attachDecoration(new IRDIndexType(indexType));
+                // Push the script when the read may hit a list get(int) that needs it; the bootstrap passes, charges or drops it.
+                if (DefaultSemanticAnalysisPhase.defBraceLoadNeedsScript(scriptScope, indexType)) {
+                    irLoadBraceDefNode.attachCondition(IRCScriptAware.class);
+                }
                 irLoadNode = irLoadBraceDefNode;
             }
         } else if (scriptScope.getCondition(userBraceNode, MapShortcut.class)) {
@@ -1978,6 +1993,8 @@ public class DefaultUserTreeToIRTreePhase implements UserTreeVisitor<ScriptScope
                 LoadListShortcutNode irLoadListShortcutNode = new LoadListShortcutNode(location);
                 irLoadListShortcutNode.attachDecoration(new IRDExpressionType(valueType));
                 irLoadListShortcutNode.attachDecoration(new IRDMethod(getter));
+                // A list read through brackets charges the receiver type's get(int) estimator like a call would.
+                attachAllocationEstimator(irLoadListShortcutNode, scriptScope, getter);
                 irLoadNode = irLoadListShortcutNode;
             }
         } else {
@@ -2008,15 +2025,11 @@ public class DefaultUserTreeToIRTreePhase implements UserTreeVisitor<ScriptScope
 
             irCallSubDefNode.attachDecoration(new IRDExpressionType(valueType));
             irCallSubDefNode.attachDecoration(new IRDName(userCallNode.getMethodName()));
-            // Push the script receiver (the 'S' recipe) when the target might be @script_aware (cancellation) or, with tracking
-            // on, @allocates — the bootstrap needs it to poll/charge. Receiver-independent name/arity checks.
-            PainlessLookup painlessLookup = scriptScope.getPainlessLookup();
-            String methodName = userCallNode.getMethodName();
-            int argumentCount = userCallNode.getArgumentNodes().size();
-            boolean pushScriptThis = painlessLookup.hasAnnotationAwareMethod(ScriptAwareAnnotation.class, methodName, argumentCount)
-                || (scriptScope.getCompilerSettings().isAllocationTrackingEnabled()
-                    && painlessLookup.hasAnnotationAwareMethod(AllocatesAnnotation.class, methodName, argumentCount));
-            if (pushScriptThis) {
+            if (DefaultSemanticAnalysisPhase.defCallNeedsScript(
+                scriptScope,
+                userCallNode.getMethodName(),
+                userCallNode.getArgumentNodes().size()
+            )) {
                 irCallSubDefNode.attachCondition(IRCScriptAware.class);
             }
             irExpressionNode = irCallSubDefNode;
