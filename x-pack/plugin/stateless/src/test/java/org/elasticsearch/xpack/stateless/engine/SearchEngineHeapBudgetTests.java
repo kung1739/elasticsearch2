@@ -8,6 +8,7 @@
 package org.elasticsearch.xpack.stateless.engine;
 
 import org.apache.lucene.index.NoMergePolicy;
+import org.elasticsearch.cluster.routing.SplitShardCountSummary;
 import org.elasticsearch.common.UUIDs;
 import org.elasticsearch.common.breaker.CircuitBreaker;
 import org.elasticsearch.common.settings.Settings;
@@ -20,6 +21,7 @@ import java.util.HashMap;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Function;
 
 import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.greaterThan;
@@ -407,7 +409,12 @@ public class SearchEngineHeapBudgetTests extends AbstractEngineTestCase {
             long r1Bytes = trackingBreaker.getUsed();
             assertThat("R1 must reserve bytes for its two segments", r1Bytes, greaterThan(0L));
 
-            Engine.Searcher pinnedR1 = searchEngine.acquireSearcher("pin-r1");
+            Engine.Searcher pinnedR1 = searchEngine.acquireSearcher(
+                "pin-r1",
+                Engine.SearcherScope.EXTERNAL,
+                SplitShardCountSummary.IRRELEVANT,
+                Function.identity()
+            );
             try {
                 // Force-merge to a single segment so R_post-merge has DIFFERENT segments than R1. R1's
                 // reservation entries are now unique to R1 — closing R1 frees real bytes.
@@ -535,7 +542,12 @@ public class SearchEngineHeapBudgetTests extends AbstractEngineTestCase {
             searchTaskQueue.runAllRunnableTasks();
 
             // Open a reader that retain _0
-            Engine.Searcher pinned = searchEngine.acquireSearcher("test");
+            Engine.Searcher pinned = searchEngine.acquireSearcher(
+                "test",
+                Engine.SearcherScope.EXTERNAL,
+                SplitShardCountSummary.IRRELEVANT,
+                Function.identity()
+            );
             try {
                 // Create a second segment _1
                 indexEngine.index(randomDoc("doc1"));

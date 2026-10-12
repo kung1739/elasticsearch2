@@ -9,6 +9,7 @@ package org.elasticsearch.xpack.inference.mapper;
 
 import com.carrotsearch.randomizedtesting.annotations.ParametersFactory;
 
+import org.elasticsearch.cluster.routing.SplitShardCountSummary;
 import org.elasticsearch.common.bytes.BytesArray;
 import org.elasticsearch.common.bytes.BytesReference;
 import org.elasticsearch.common.settings.Settings;
@@ -42,6 +43,7 @@ import org.elasticsearch.xpack.inference.model.TestModel;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.function.Function;
 
 import static org.elasticsearch.xpack.inference.mapper.SemanticTextFieldTests.generateRandomChunkingSettings;
 import static org.elasticsearch.xpack.inference.mapper.SemanticTextFieldTests.randomChunkedInferenceEmbeddingByte;
@@ -178,7 +180,12 @@ public class SemanticInferenceMetadataFieldsRecoveryTests extends EngineTestCase
         }
         engine.flush();
 
-        var searcher = engine.acquireSearcher("test", Engine.SearcherScope.INTERNAL);
+        var searcher = engine.acquireSearcher(
+            "test",
+            Engine.SearcherScope.INTERNAL,
+            SplitShardCountSummary.IRRELEVANT,
+            Function.identity()
+        );
         try (
             var snapshot = newRandomSnapshot(
                 engine.config().getMapperService(),

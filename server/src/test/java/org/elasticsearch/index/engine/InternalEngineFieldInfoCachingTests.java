@@ -13,12 +13,14 @@ import org.apache.lucene.index.DirectoryReader;
 import org.apache.lucene.index.FieldInfo;
 import org.apache.lucene.index.LeafReaderContext;
 import org.apache.lucene.index.SegmentReader;
+import org.elasticsearch.cluster.routing.SplitShardCountSummary;
 import org.elasticsearch.common.lucene.Lucene;
 import org.elasticsearch.index.store.FieldInfoCachingDirectory;
 import org.hamcrest.Matchers;
 
 import java.util.HashMap;
 import java.util.Map;
+import java.util.function.Function;
 
 /**
  * End-to-end test that {@link FieldInfoCachingDirectory} kicks in on the {@link InternalEngine} write path and produces
@@ -39,7 +41,14 @@ public class InternalEngineFieldInfoCachingTests extends EngineTestCase {
         }
         engine.refresh("test");
 
-        try (Engine.Searcher searcher = engine.acquireSearcher("test")) {
+        try (
+            Engine.Searcher searcher = engine.acquireSearcher(
+                "test",
+                Engine.SearcherScope.EXTERNAL,
+                SplitShardCountSummary.IRRELEVANT,
+                Function.identity()
+            )
+        ) {
             DirectoryReader reader = searcher.getDirectoryReader();
             assertThat("test requires multiple segments", reader.leaves().size(), Matchers.greaterThan(1));
 

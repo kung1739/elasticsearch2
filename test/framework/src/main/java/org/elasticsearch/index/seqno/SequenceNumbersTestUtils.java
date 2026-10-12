@@ -13,6 +13,7 @@ import org.apache.lucene.search.DocIdSetIterator;
 import org.elasticsearch.action.support.PlainActionFuture;
 import org.elasticsearch.action.support.RefCountingListener;
 import org.elasticsearch.client.internal.Client;
+import org.elasticsearch.cluster.routing.SplitShardCountSummary;
 import org.elasticsearch.index.IndexService;
 import org.elasticsearch.index.engine.Engine;
 import org.elasticsearch.index.mapper.SeqNoFieldMapper;
@@ -24,6 +25,7 @@ import org.elasticsearch.test.InternalTestCluster;
 
 import java.io.IOException;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Function;
 
 import static org.elasticsearch.test.ESIntegTestCase.internalCluster;
 import static org.elasticsearch.test.ESTestCase.assertBusy;
@@ -75,7 +77,14 @@ public final class SequenceNumbersTestUtils {
             final var shardId = indexShard.shardId();
             var checked = indexShard.withEngineOrNull(engine -> {
                 if (engine != null) {
-                    try (var searcher = engine.acquireSearcher("assert_seq_no_dv")) {
+                    try (
+                        var searcher = engine.acquireSearcher(
+                            "assert_seq_no_dv",
+                            Engine.SearcherScope.EXTERNAL,
+                            SplitShardCountSummary.IRRELEVANT,
+                            Function.identity()
+                        )
+                    ) {
                         for (var leaf : searcher.getLeafContexts()) {
                             var leafReader = leaf.reader();
                             NumericDocValues seqNoDV = leafReader.getNumericDocValues(SeqNoFieldMapper.NAME);
@@ -153,7 +162,14 @@ public final class SequenceNumbersTestUtils {
                         if (engine == null) {
                             return null;
                         }
-                        try (var searcher = engine.acquireSearcher("assert_seq_no_count")) {
+                        try (
+                            var searcher = engine.acquireSearcher(
+                                "assert_seq_no_count",
+                                Engine.SearcherScope.EXTERNAL,
+                                SplitShardCountSummary.IRRELEVANT,
+                                Function.identity()
+                            )
+                        ) {
                             long total = 0;
                             for (var leaf : searcher.getLeafContexts()) {
                                 NumericDocValues seqNoDV = leaf.reader().getNumericDocValues(SeqNoFieldMapper.NAME);
