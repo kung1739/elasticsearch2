@@ -83,6 +83,7 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
@@ -91,6 +92,7 @@ import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.atomic.AtomicReferenceArray;
 import java.util.function.BooleanSupplier;
 import java.util.function.Consumer;
+import java.util.function.Function;
 import java.util.function.IntSupplier;
 import java.util.function.Predicate;
 import java.util.function.Supplier;
@@ -191,6 +193,30 @@ public class ExternalSourceResolver {
         }
         Map<String, Object> result = new HashMap<>(config);
         result.remove(DATASOURCE_CONFIG_KEY);
+        return result;
+    }
+
+    /**
+     * Returns a config with the dataset-tier definition version removed, for the plan that goes over the wire.
+     * <p>
+     * The version addresses the dataset-level fold, which only the coordinator mints and reads, so a data node has
+     * no use for it. Sending it anyway is not harmless where the map becomes a storage provider: a data node builds
+     * one from the external source's config and {@code StorageProviderCache} keys on the whole of it, which is why
+     * {@code StorageProviderRegistry.FRAMEWORK_KEYS} strips the file-tier version before it gets there. An OLDER
+     * node's {@code FRAMEWORK_KEYS} does not know this key, so it would reach that cache key and fragment the client
+     * pool per dataset definition rather than per credential set — and that pool throws at its ceiling rather than
+     * degrading. Not sending it needs no transport version and leaves nothing for an old node to mishandle.
+     * <p>
+     * That reason is live on the relation and the exec. On a {@code FileSplit} it is defence in depth: a data node
+     * reads a split's config only for the split markers, and no provider is built from it. Stripped there anyway,
+     * because "nothing reads it today" is not a property the next change preserves.
+     */
+    public static Map<String, Object> wireConfig(Map<String, Object> config) {
+        if (config == null || config.containsKey(DefinitionVersion.DATASET_CONFIG_KEY) == false) {
+            return config;
+        }
+        Map<String, Object> result = new HashMap<>(config);
+        result.remove(DefinitionVersion.DATASET_CONFIG_KEY);
         return result;
     }
 
@@ -821,19 +847,14 @@ public class ExternalSourceResolver {
             if (declaredMapping != null && isDeclaredSchema(declaredMapping) == false) {
                 finalSource = applyNonStrictOverlay(resolvedSource, declaredMapping, schemaInterner);
                 // When the overlay appended absent declared columns for a CSV/TSV source (which binds positionally
-                // under INFERRED provenance), upgrade to DECLARED so the reader binds by name (see
-                // bindsAbsentDeclaredColumnsByName). The overlay grows the schema by exactly those columns.
+                // under INFERRED provenance), the reader must bind by name instead. The overlay grows the schema by
+                // exactly those columns, so comparing sizes is how this rail learns there were any.
+                //
+                // The upgrade is overlaidReadSpec's and is not written again here: one method decides both the spec
+                // the read PERFORMS and the spec a statistics address is derived from, and two copies of that rule
+                // is how the two came to disagree.
                 boolean appendedAbsent = finalSource.metadata().schema().size() > resolvedSource.metadata().schema().size();
-                if (bindsAbsentDeclaredColumnsByName(appendedAbsent, resolvedSource.metadata().sourceType())) {
-                    effectiveReadSpec = DeclaredReadSpec.of(
-                        declaredReadSpec.renames(),
-                        declaredReadSpec.dateFormats(),
-                        declaredReadSpec.declaredTypeColumns(),
-                        SchemaProvenance.DECLARED
-                    );
-                } else {
-                    effectiveReadSpec = declaredReadSpec;
-                }
+                effectiveReadSpec = overlaidReadSpec(declaredMapping, appendedAbsent, resolvedSource.metadata().sourceType());
             } else {
                 finalSource = resolvedSource;
                 effectiveReadSpec = declaredReadSpec;
@@ -1282,7 +1303,11 @@ public class ExternalSourceResolver {
                     schemaEntry,
                     schema,
                     fileConfig,
-                    cachedStatistics(schemaKey, schemaEntry, readConfigStampOf(schemaEntry)),
+                    cachedStatistics(
+                        schemaKey,
+                        schemaEntry,
+                        statisticsAddressFor(schemaEntry, overlaidBoundReadOf(declaredMapping, datasetFormat))
+                    ),
                     harvestedStatistics
                 );
                 storageEntry = new StorageEntry(storagePath, meta.length(), Instant.ofEpochMilli(meta.mtimeMillis()));
@@ -1440,6 +1465,7 @@ public class ExternalSourceResolver {
                             storageIdentity,
                             secretIdentity,
                             fileConfig,
+                            declaredMapping,
                             schemaResolution,
                             cacheable,
                             datasetFormat,
@@ -1487,10 +1513,12 @@ public class ExternalSourceResolver {
                             secretIdentity,
                             fileConfig,
                             null,
-                            // The anchor resolve is what DECIDES the bound read, so there is no bound read to address
-                            // statistics by yet. Its own schema record is the right answer for it either way: the file it
-                            // describes and the file the query will read at that schema are the same file.
-                            null,
+                            // The anchor resolve is what DECIDES the schema every file on this rail is read at, so there
+                            // is no bound read from elsewhere to address statistics by. Its own record answers for an
+                            // undeclared read: the file it describes and the file the query reads are the same file at
+                            // the same schema. A non-strict declaration breaks that equality - the anchor is read at the
+                            // OVERLAID version of its own schema - so address by that instead.
+                            overlaidBoundReadOf(declaredMapping, datasetFormat),
                             anchorListener.map(meta -> (ExternalSourceMetadata) meta)
                         );
                     } else {
@@ -1539,6 +1567,10 @@ public class ExternalSourceResolver {
                 ? enrichWithFileCount(anchorMetadata, listing.fileCount())
                 : markStatsAsPartial(anchorMetadata);
             final ExternalSourceMetadata base = withSourceType(counted, datasetFormat);
+            // Every file on this rail is read at the anchor's schema, so one value is the read whose statistics
+            // every per-file lookup on it wants - and under a non-strict declaration that is the OVERLAID anchor
+            // schema, which is what the data node hashes when it stamps a harvest.
+            final String boundRead = ffwBoundRead(base, declaredMapping);
             if (listing.fileCount() > 1 && demand.requiresStats()) {
                 // For multi-file FIRST_FILE_WINS, read all files' metadata during Phase 1 to aggregate statistics
                 // across all files. This allows aggregate pushdown (COUNT/MIN/MAX) to use accurate global stats and
@@ -1568,13 +1600,7 @@ public class ExternalSourceResolver {
                 Set<String> declaredTypeColumns = physicalDeclaredTypeColumnsOf(declaredMapping);
                 // Prefetch the dataset-level aggregate BEFORE the per-file stats gather — see
                 // applyDatasetAggregate for why post-gather reads self-defeat under cache pressure.
-                DatasetAggregatePrefetch datasetPrefetch = prefetchDatasetAggregate(
-                    listing,
-                    storageIdentity,
-                    secretIdentity,
-                    config,
-                    cacheable
-                );
+                DatasetAggregatePrefetch datasetPrefetch = prefetchDatasetAggregate(listing, config, cacheable);
                 // Under skip_row a narrow-read parse failure drops the whole row, so the unread files' counts are
                 // stripped at commit (dropRowCount) and the dataset-aggregate promise can never be fulfilled -
                 // every warm COUNT(*) would re-scan, which is worse than the reads the stop saves. The predicate
@@ -1613,7 +1639,8 @@ public class ExternalSourceResolver {
                                 secretIdentity,
                                 config,
                                 ffwInferredTypes,
-                                ffwSlimStats
+                                ffwSlimStats,
+                                boundRead
                             )
                         );
                     } catch (Exception e) {
@@ -1630,10 +1657,9 @@ public class ExternalSourceResolver {
                         ffwReadConfigs,
                         ffwInferredTypes,
                         ffwSlimStats,
-                        // Every file on this rail is read at the anchor's schema, so that is the read whose
-                        // statistics each per-file lookup wants. Null leaves every lookup on the schema record
-                        // alone, which is the behaviour before this address existed.
-                        ReadConfigFingerprint.of(base.schema(), declaredReadSpecOf(declaredMapping)),
+                        // The gather takes a per-record derivation; this rail's answer is the same for every
+                        // record, so the hoisted value is what the function returns.
+                        record -> boundRead,
                         everyFileNeededForThePromise,
                         statsListener
                     );
@@ -1661,10 +1687,21 @@ public class ExternalSourceResolver {
                 // path produces, which downstream already handles (SplitStats.resolveEffectiveStats returns null
                 // rather than consuming anchor stats as global). STATS_FILE_COUNT, stamped above, is preserved.
                 listener.onResponse(
-                    finishFirstFileWins(discovery, markStatsAsPartial(base), storageIdentity, secretIdentity, config, Map.of(), Map.of())
+                    finishFirstFileWins(
+                        discovery,
+                        markStatsAsPartial(base),
+                        storageIdentity,
+                        secretIdentity,
+                        config,
+                        Map.of(),
+                        Map.of(),
+                        boundRead
+                    )
                 );
             } else {
-                listener.onResponse(finishFirstFileWins(discovery, base, storageIdentity, secretIdentity, config, Map.of(), Map.of()));
+                listener.onResponse(
+                    finishFirstFileWins(discovery, base, storageIdentity, secretIdentity, config, Map.of(), Map.of(), boundRead)
+                );
             }
         } catch (Exception e) {
             listener.onFailure(e);
@@ -1756,7 +1793,8 @@ public class ExternalSourceResolver {
         String secretIdentity,
         Map<String, Object> config,
         Map<StoragePath, Map<String, DataType>> inferredTypesByPath,
-        Map<StoragePath, SourceStatistics> slimStatsByPath
+        Map<StoragePath, SourceStatistics> slimStatsByPath,
+        @Nullable String boundRead
     ) {
         // The schema's listing answers what the anchor is. The scan's file set answers which files get read, and is
         // what the per-file map below, the resolved source, and the partition columns come off - the two are the
@@ -1801,7 +1839,14 @@ public class ExternalSourceResolver {
                 // cache harvest (the single-unit footer skip needs those column stats). A one-file
                 // listing keeps the anchor harvest.
                 StoragePath path = listing.path(i);
-                CachedFile cached = schemaCacheEntry(path, listing.lastModifiedMillis(i), storageIdentity, secretIdentity, config);
+                CachedFile cached = schemaCacheEntry(
+                    path,
+                    listing.lastModifiedMillis(i),
+                    storageIdentity,
+                    secretIdentity,
+                    config,
+                    boundRead
+                );
                 Map<String, DataType> inferred = inferredTypesByPath.get(path);
                 if (inferred == null) {
                     inferred = inferredTypesFromCache(cached);
@@ -1912,7 +1957,8 @@ public class ExternalSourceResolver {
         long mtimeMillis,
         String storageIdentity,
         String secretIdentity,
-        @Nullable Map<String, Object> config
+        @Nullable Map<String, Object> config,
+        @Nullable String boundRead
     ) {
         if (cacheService == null || cacheService.isEnabled() == false) {
             return null;
@@ -1927,7 +1973,7 @@ public class ExternalSourceResolver {
         if (record == null) {
             return null;
         }
-        Map<String, Object> statistics = cachedStatistics(key, record, readConfigStampOf(record));
+        Map<String, Object> statistics = cachedStatistics(key, record, statisticsAddressFor(record, boundRead));
         return new CachedFile(record, statistics);
     }
 
@@ -2450,7 +2496,7 @@ public class ExternalSourceResolver {
      * for a reader-overridden resolve. Package-private for testing.
      */
     @Nullable
-    DatasetAggregateKey datasetAggregateKey(FileList listing, String storageIdentity, String secretIdentity, Map<String, Object> config) {
+    DatasetAggregateKey datasetAggregateKey(FileList listing, Map<String, Object> config) {
         if (listing == null || listing.fileSetFingerprint() == null || listing.fileCount() < 2) {
             return null;
         }
@@ -2458,11 +2504,15 @@ public class ExternalSourceResolver {
         if (format == null) {
             return null;
         }
-        return DatasetAggregateKey.of(
-            listing.originalPattern(),
-            listing.fileSetFingerprint(),
-            datasetIdentity(listing.path(0).objectName(), storageIdentity, secretIdentity, storageConfig(config))
-        );
+        // A dataset-level fold belongs to one definition entire, so an edit to it moves this address. Only the
+        // legacy EXTERNAL command reaches here without a definition - a registered dataset always carries one -
+        // and that command is being removed, so such a query keeps the per-file rail rather than being given an
+        // address with nothing behind it to move when anything changes.
+        Object datasetVersion = config == null ? null : config.get(DefinitionVersion.DATASET_CONFIG_KEY);
+        if (datasetVersion instanceof String version && version.isEmpty() == false) {
+            return DatasetAggregateKey.of(listing.originalPattern(), listing.fileSetFingerprint(), version);
+        }
+        return null;
     }
 
     /**
@@ -2515,14 +2565,8 @@ public class ExternalSourceResolver {
      */
     record DatasetAggregatePrefetch(@Nullable DatasetAggregateKey key, @Nullable Map<String, Object> prefetched) {}
 
-    private DatasetAggregatePrefetch prefetchDatasetAggregate(
-        FileList listing,
-        String storageIdentity,
-        String secretIdentity,
-        Map<String, Object> config,
-        boolean cacheable
-    ) {
-        DatasetAggregateKey key = cacheable ? datasetAggregateKey(listing, storageIdentity, secretIdentity, config) : null;
+    private DatasetAggregatePrefetch prefetchDatasetAggregate(FileList listing, Map<String, Object> config, boolean cacheable) {
+        DatasetAggregateKey key = cacheable ? datasetAggregateKey(listing, config) : null;
         return new DatasetAggregatePrefetch(key, key != null ? cacheService.getDatasetAggregate(key) : null);
     }
 
@@ -2578,6 +2622,16 @@ public class ExternalSourceResolver {
                 // immediately is a pre-existing main bug tracked separately (GA issue); this guard only
                 // keeps the dataset aggregate from memoizing it.
                 if (rowCount instanceof Number n && listingPathsAreDistinct(listing)) {
+                    // This write-through is NOT licence-gated: RunningFileStatsFold.finish returns its merged
+                    // fold whether or not every file licensed the crossing, so a lenient read's fold is stored
+                    // here too - and that fold may be a SURVIVOR count rather than the file's physical record
+                    // count, because the CSV reader drops a structurally malformed row under null_field as well
+                    // as skip_row (warmsRowCountSafely spells this out).
+                    //
+                    // What keeps that safe is the ADDRESS, not the error policy. DefinitionVersion.ofDataset
+                    // folds every setting of the dataset and its source, error_mode included, so a survivor
+                    // count is reachable only from the definition whose read produced it. Anything that widens
+                    // this address has to re-answer that, which is why the reason is recorded here.
                     cacheService.putDatasetAggregate(datasetKey, n.longValue());
                 }
             }
@@ -2585,7 +2639,10 @@ public class ExternalSourceResolver {
         }
         cacheService.recordStatsAggregateIncomplete();
         if (prefetch.prefetched() != null) {
-            // Needed (per-file merge incomplete) AND present: the fallback actually served.
+            // Needed (per-file merge incomplete) AND present: the fallback actually served. What it serves now
+            // was addressed by the definition it belongs to, so a count minted under a different definition is
+            // not reachable from here at all. No licence is involved on this path: see the write-through above,
+            // which stores a lenient read's fold too, and relies on that address rather than on the policy.
             cacheService.recordDatasetAggregateHit();
             return prefetch.prefetched();
         }
@@ -2637,6 +2694,7 @@ public class ExternalSourceResolver {
         String storageIdentity,
         String secretIdentity,
         Map<String, Object> config,
+        @Nullable DatasetMapping declaredMapping,
         FormatReader.SchemaResolution schemaResolution,
         boolean cacheable,
         @Nullable String datasetFormat,
@@ -2659,7 +2717,7 @@ public class ExternalSourceResolver {
         String formatForStats = datasetFormat != null ? datasetFormat : registeredFormatName(fileList.path(0), config);
         boolean implicitNulls = foldsAbsentColumnAsImplicitNull(formatForStats);
         RunningFileStatsFold fold = RunningFileStatsFold.reconciliation(implicitNulls);
-        DatasetAggregatePrefetch datasetPrefetch = prefetchDatasetAggregate(fileList, storageIdentity, secretIdentity, config, cacheable);
+        DatasetAggregatePrefetch datasetPrefetch = prefetchDatasetAggregate(fileList, config, cacheable);
         // Each file's private toAttributes() list stays reachable until gatherPerFile's completion drops
         // its list. That is after this listener returns, so overlay and the next path's listing still run
         // under the charge. queryHeld keeps the listing credit and the unique-schema overflow until query
@@ -2798,6 +2856,11 @@ public class ExternalSourceResolver {
             fold,
             schemaInterner,
             privateLists,
+            // Every file is read at its own schema on this rail, overlaid by any non-strict declaration - which
+            // holds for strict and for a union whose files agree. A union_by_name file that the reconciliation
+            // pinned to another type is read at a schema other than its own, and still warms nothing; that case is
+            // out of scope here. With no declaration the record's own stamp IS that read and this is null.
+            overlaidBoundReadOf(declaredMapping, datasetFormat),
             metadataListener
         );
     }
@@ -2929,6 +2992,7 @@ public class ExternalSourceResolver {
         RunningFileStatsFold fold,
         SchemaInterner schemaInterner,
         @Nullable ExternalPlanningReservation.Run privateLists,
+        @Nullable Function<SchemaCacheEntry, String> boundReadOf,
         ActionListener<Map<StoragePath, SourceMetadata>> listener
     ) {
         int fileCount = fileList.fileCount();
@@ -2941,7 +3005,7 @@ public class ExternalSourceResolver {
             fold,
             schemaInterner,
             privateLists,
-            null,
+            boundReadOf,
             GatherPurpose.SCHEMA_RECONCILIATION,
             false,
             ActionListener.wrap(perFile -> {
@@ -3064,7 +3128,7 @@ public class ExternalSourceResolver {
         @Nullable RunningFileStatsFold fold,
         @Nullable SchemaInterner schemaInterner,
         @Nullable ExternalPlanningReservation.Run privateLists,
-        @Nullable String boundReadConfig,
+        @Nullable Function<SchemaCacheEntry, String> boundReadOf,
         GatherPurpose purpose,
         boolean everyFileNeededForThePromise,
         ActionListener<List<SourceMetadata>> listener
@@ -3147,7 +3211,7 @@ public class ExternalSourceResolver {
                         secretIdentity,
                         config,
                         admission,
-                        boundReadConfig,
+                        boundReadOf,
                         sharedSampleSizeByFormat,
                         itemListener
                     );
@@ -3255,10 +3319,10 @@ public class ExternalSourceResolver {
         String secretIdentity,
         Map<String, Object> config,
         @Nullable SchemaFanOutAdmission admission,
-        @Nullable String boundReadConfig,
+        @Nullable Function<SchemaCacheEntry, String> boundReadOf,
         ActionListener<SourceMetadata> listener
     ) {
-        cachedResolveSingleSourceAsync(filePath, hint, storageIdentity, secretIdentity, config, admission, boundReadConfig, null, listener);
+        cachedResolveSingleSourceAsync(filePath, hint, storageIdentity, secretIdentity, config, admission, boundReadOf, null, listener);
     }
 
     /**
@@ -3275,7 +3339,7 @@ public class ExternalSourceResolver {
         String secretIdentity,
         Map<String, Object> config,
         @Nullable SchemaFanOutAdmission admission,
-        @Nullable String boundReadConfig,
+        @Nullable Function<SchemaCacheEntry, String> boundReadOf,
         @Nullable Map<String, Integer> sharedSampleSizeByFormat,
         ActionListener<SourceMetadata> listener
     ) {
@@ -3317,8 +3381,7 @@ public class ExternalSourceResolver {
             // statistics_cache.misses, the ratio an operator reads to size that store.
             Map<String, Object> statistics = null;
             if (publishesScanDerivedStatistics(cached)) {
-                String measuredUnder = schemaRecordAnswersTheRead(cached, boundReadConfig) ? readConfigStampOf(cached) : boundReadConfig;
-                statistics = cachedStatistics(schemaKey, cached, measuredUnder);
+                statistics = cachedStatistics(schemaKey, cached, statisticsAddressFor(cached, boundReadOf));
             }
             pendingMetadataWarnings.addAll(cached.warnings());
             // Served with no statistics when nothing has been harvested under that read yet: a correct schema
@@ -3375,7 +3438,25 @@ public class ExternalSourceResolver {
         if (cacheService == null || publishesScanDerivedStatistics(entry) == false) {
             return null;
         }
-        return cacheService.getStatistics(StatisticsKey.of(schemaKey, readConfig));
+        Map<String, Object> atThisRead = cacheService.getStatistics(StatisticsKey.of(schemaKey, readConfig));
+        if (atThisRead != null) {
+            return atThisRead;
+        }
+        // Nothing at this read's own address. The record's address may still hold a count this read may have:
+        // a physical record count that its producer licensed as read-independent, which under fail_fast is the
+        // same number for every declaration. Addressing by the overlaid read alone made a declaration over an
+        // already-measured corpus re-scan it to re-derive a number that was already stored and already known to
+        // be identical - so the fallback is what keeps that sharing, and it is the only thing it can share:
+        // restrictToReadConfig drops every per-column statistic, and drops the count too unless it was licensed.
+        //
+        // The restriction is applied HERE rather than relied on downstream, because only one serve path runs that
+        // gate itself. Second ask only when the first missed, so a warm read still books one lookup.
+        String ownAddress = readConfigStampOf(entry);
+        if (Objects.equals(ownAddress, readConfig)) {
+            return null; // the record's address IS this read's; there is no second place to look
+        }
+        Map<String, Object> atOwnRead = cacheService.getStatistics(StatisticsKey.of(schemaKey, ownAddress));
+        return atOwnRead == null ? null : SourceStatisticsSerializer.restrictToReadConfig(atOwnRead, readConfig);
     }
 
     /**
@@ -4070,7 +4151,7 @@ public class ExternalSourceResolver {
         Map<String, String> readConfigsOut,
         Map<StoragePath, Map<String, DataType>> inferredTypesOut,
         Map<StoragePath, SourceStatistics> slimStatsOut,
-        @Nullable String boundReadConfig,
+        @Nullable Function<SchemaCacheEntry, String> boundReadOf,
         boolean everyFileNeededForThePromise,
         ActionListener<Map<String, Object>> listener
     ) {
@@ -4083,7 +4164,7 @@ public class ExternalSourceResolver {
             fold,
             null,
             null,
-            boundReadConfig,
+            boundReadOf,
             GatherPurpose.STATS_AGGREGATE,
             everyFileNeededForThePromise,
             ActionListener.wrap(allMeta -> {
@@ -5552,6 +5633,136 @@ public class ExternalSourceResolver {
     }
 
     /**
+     * One file's resolved read under a non-strict declaration: the schema the reader will bind, and the spec it binds
+     * under. The pair every consumer of a read configuration needs, derived in one place so that the address a
+     * statistics lookup asks and the expectation the serve gate compares against cannot drift apart - which is the
+     * agreement {@code ReadConfigFingerprintDerivationSitesTests} exists to hold.
+     */
+    record OverlaidRead(List<Attribute> readSchema, DeclaredReadSpec spec) {
+        /**
+         * One derivation for both the address and the serve expectation, so a change to either moves both. Not a
+         * guarantee that they agree on every input: a caller that cannot see the unified schema passes the file's
+         * own, deciding {@code absent()} differently. {@link #overlaidBoundReadOf} names the cell where that bites.
+         */
+        String fingerprint() {
+            return ReadConfigFingerprint.of(readSchema, spec);
+        }
+    }
+
+    /**
+     * Where this read's measurements live: the bound read when the schema record cannot answer it, else the
+     * record's own. One owner, so the single-file rail and the per-file gather ask the same question.
+     */
+    @Nullable
+    private static String statisticsAddressFor(SchemaCacheEntry record, @Nullable Function<SchemaCacheEntry, String> boundReadOf) {
+        return statisticsAddressFor(record, boundReadOf == null ? null : boundReadOf.apply(record));
+    }
+
+    @Nullable
+    private static String statisticsAddressFor(SchemaCacheEntry record, @Nullable String bound) {
+        return schemaRecordAnswersTheRead(record, bound) ? readConfigStampOf(record) : bound;
+    }
+
+    /**
+     * The read every file on the first-file-wins rail is bound under. This rail reads every file at the ANCHOR's
+     * schema, so one value addresses the whole listing and the caller derives it once.
+     * <p>
+     * Under a non-strict declaration that read is the OVERLAID anchor schema, which is what the data node hashes
+     * when it stamps a harvest. Without the overlay it names a configuration no read performs. An undeclared or
+     * strict read keeps the derivation it had.
+     */
+    // Package-private for testing.
+    static String ffwBoundRead(ExternalSourceMetadata base, @Nullable DatasetMapping declaredMapping) {
+        return declaredMapping == null || isDeclaredSchema(declaredMapping)
+            ? ReadConfigFingerprint.of(base.schema(), declaredReadSpecOf(declaredMapping))
+            : overlaidReadOf(base.schema(), base.schema(), declaredMapping, base.sourceType()).fingerprint();
+    }
+
+    /**
+     * How a rail addresses one file's statistics: the read that file will be bound under, via
+     * {@link #overlaidReadOf}. {@code null} for an undeclared or strict read, where the record's own stamp IS the
+     * bound read.
+     * <p>
+     * {@code datasetFormat} is the RESOLVED source type and wins over the record's own, because the provenance
+     * upgrade is format-dependent ({@link #bindsAbsentDeclaredColumnsByName} admits csv and tsv only).
+     */
+    @Nullable
+    // Package-private for testing.
+    static Function<SchemaCacheEntry, String> overlaidBoundReadOf(
+        @Nullable DatasetMapping declaredMapping,
+        @Nullable String datasetFormat
+    ) {
+        if (declaredMapping == null || isDeclaredSchema(declaredMapping)) {
+            return null;
+        }
+        // The record's own schema stands in for the unified one, because a function built before the gather cannot
+        // see the union. Exact for the explicit single file and the anchor resolve, whose record IS the unified
+        // schema. Under union_by_name it diverges only for a column SOME files carry and this one does not, which
+        // is a separate defect: such a file stays cold either way, missing at an address of its own.
+        return record -> {
+            List<Attribute> own = record.toAttributes();
+            return overlaidReadOf(own, own, declaredMapping, datasetFormat != null ? datasetFormat : record.sourceType()).fingerprint();
+        };
+    }
+
+    /**
+     * The per-file overlaid read schema: the lenient per-file overlay, plus any declared column absent from the
+     * unified inferred schema.
+     * <p>
+     * Absent declared columns are appended to every per-file schema. NDJSON resolves values by JSON key and
+     * Parquet/ORC by column name; for CSV/TSV {@link #resolveNextPath} upgrades provenance to
+     * {@link SchemaProvenance#DECLARED} so the reader binds by header name rather than by position. Rows not
+     * carrying the field null-fill the slot and the reader warns.
+     * <p>
+     * Under union-by-name {@code absent} is empty whenever the column appeared in any file's inferred schema; the
+     * lenient per-file overlay leaves the other files' slots as null-fill.
+     */
+    private static List<Attribute> overlaidPerFileSchema(
+        List<Attribute> fileSchema,
+        DatasetMapping declaredMapping,
+        List<Attribute> absent
+    ) {
+        List<Attribute> perFile = DeclaredSchemaResolver.overlayNonStrict(fileSchema, declaredMapping, true).fileSchema();
+        if (absent.isEmpty()) {
+            return perFile;
+        }
+        ArrayList<Attribute> extended = new ArrayList<>(perFile);
+        extended.addAll(absent);
+        return List.copyOf(extended);
+    }
+
+    /**
+     * The read spec a non-strict declaration resolves to, provenance upgrade included. {@link #resolveNextPath}
+     * asks this too, so the spec the read performs and the spec an address is derived from cannot diverge.
+     */
+    private static DeclaredReadSpec overlaidReadSpec(DatasetMapping declaredMapping, boolean hasAbsentColumns, String sourceType) {
+        DeclaredReadSpec spec = declaredReadSpecOf(declaredMapping);
+        if (bindsAbsentDeclaredColumnsByName(hasAbsentColumns, sourceType) == false) {
+            return spec;
+        }
+        return DeclaredReadSpec.of(spec.renames(), spec.dateFormats(), spec.declaredTypeColumns(), SchemaProvenance.DECLARED);
+    }
+
+    /**
+     * The read one file resolves to under a non-strict declaration, from the file's own inferred schema and the
+     * unified one the declaration is overlaid onto. {@link #applyNonStrictOverlay} composes the halves directly
+     * instead, holding one unified overlay for the listing rather than recomputing it per file.
+     */
+    // Package-private for testing.
+    static OverlaidRead overlaidReadOf(
+        List<Attribute> fileSchema,
+        List<Attribute> unifiedSchema,
+        DatasetMapping declaredMapping,
+        String sourceType
+    ) {
+        DeclaredSchemaResolver.Overlaid unified = DeclaredSchemaResolver.overlayNonStrict(unifiedSchema, declaredMapping, false);
+        return new OverlaidRead(
+            overlaidPerFileSchema(fileSchema, declaredMapping, unified.absent()),
+            overlaidReadSpec(declaredMapping, unified.absent().isEmpty() == false, sourceType)
+        );
+    }
+
+    /**
      * Apply a non-strict declared mapping onto an already-resolved (inferred) source: retype/rename the declared
      * columns in the user-facing schema and in each per-file schema (lenient — a column may be absent from one
      * file under union-by-name), preserving the inferred stats/sourceMetadata and the per-file column mappings.
@@ -5602,17 +5813,7 @@ public class ExternalSourceResolver {
                 pendingSchemaWarnings.add(SkipWarnings.absentColumnMessage(physical));
             }
         }
-        DeclaredReadSpec declaredReadSpec = declaredReadSpecOf(declaredMapping);
-        // Mirror the provenance upgrade the outer resolver applies (see resolveNextPath) so the fingerprint hashes
-        // what the data-node's read will produce.
-        if (bindsAbsentDeclaredColumnsByName(unified.absent().isEmpty() == false, inferred.sourceType())) {
-            declaredReadSpec = DeclaredReadSpec.of(
-                declaredReadSpec.renames(),
-                declaredReadSpec.dateFormats(),
-                declaredReadSpec.declaredTypeColumns(),
-                SchemaProvenance.DECLARED
-            );
-        }
+        DeclaredReadSpec declaredReadSpec = overlaidReadSpec(declaredMapping, unified.absent().isEmpty() == false, inferred.sourceType());
         // S1 boundary: the warm-aggregate _stats.* map on sourceMetadata is keyed PHYSICAL and holds INFERRED-type values;
         // the declared overlay renames/retypes the plan afterwards. Rekey renames (a pure `path` move changes no value, so
         // the rekeyed stats stay exactly correct — warm serving survives the rename) and poison extrema + drop counts for
@@ -5689,28 +5890,8 @@ public class ExternalSourceResolver {
                     e.getKey().objectName()
                 );
             }
-            DeclaredSchemaResolver.Overlaid perFile = DeclaredSchemaResolver.overlayNonStrict(
-                info.fileSchema().attributes(),
-                declaredMapping,
-                true
-            );
-            // Absent declared columns (missing from the unified inferred schema, because the sample did not reach
-            // them or the source does not carry them) are appended to every per-file schema. NDJSON resolves field
-            // values by JSON key and Parquet/ORC by column name; for CSV/TSV resolveNextPath upgrades provenance to
-            // DECLARED so the reader binds by header name (or col<N> to field N) rather than by schema position. In
-            // every case, rows that do not carry the field null-fill the slot and the reader warns.
-            // Under union-by-name, absent() is empty whenever the column appeared in at least one file's
-            // inferred schema — the lenient per-file overlay correctly skips truly absent columns in the other
-            // files, leaving their column-mapping slots as null-fill, which is the intended behavior.
-            List<Attribute> perFileSchema;
-            if (unified.absent().isEmpty()) {
-                perFileSchema = perFile.fileSchema();
-            } else {
-                ArrayList<Attribute> extended = new ArrayList<>(perFile.fileSchema());
-                extended.addAll(unified.absent());
-                perFileSchema = List.copyOf(extended);
-            }
-            String perFileReadConfig = ReadConfigFingerprint.of(perFileSchema, declaredReadSpec);
+            List<Attribute> perFileSchema = overlaidPerFileSchema(info.fileSchema().attributes(), declaredMapping, unified.absent());
+            String perFileReadConfig = new OverlaidRead(perFileSchema, declaredReadSpec).fingerprint();
             if (expectedReadConfig == null) {
                 expectedReadConfig = perFileReadConfig;
             } else if (expectedReadConfig.equals(perFileReadConfig) == false) {
@@ -5757,7 +5938,7 @@ public class ExternalSourceResolver {
         if (expectedReadConfig == null) {
             // Defensive only: a stamped entry always has a non-empty schema and therefore a non-empty schemaMap
             // (an empty schema stamps UNKNOWN and never reaches here).
-            expectedReadConfig = ReadConfigFingerprint.of(dataOnlyUnifiedOverlaid, declaredReadSpec);
+            expectedReadConfig = new OverlaidRead(dataOnlyUnifiedOverlaid, declaredReadSpec).fingerprint();
         }
         if (perFileReadConfigsDisagree) {
             // Files read under different configurations: no single expectation is right, so strip the per-column
