@@ -14,47 +14,23 @@ import org.elasticsearch.cluster.metadata.ProjectId;
 import org.elasticsearch.core.Nullable;
 
 /**
- * SPI hook called just before the global-metadata blob ({@code meta-<uuid>.dat}) is written
- * during snapshot creation. Implementors can transform the {@link Metadata} to re-wrap
- * or remove project-scoped encrypted data.
- *
- * <p>Contract: return the <em>same</em> {@link Metadata} instance if no transformation is
- * needed; a different instance signals that the state was modified. Returning the same instance
- * avoids unnecessary serialization work.
- *
- * <p>Providers are discovered via {@code pluginsService.loadServiceProviders} in
- * {@code NodeConstruction} and handed to both {@link SnapshotsService} (for use during
- * finalization) and {@link org.elasticsearch.action.admin.cluster.snapshots.create.TransportCreateSnapshotAction}
- * (for pre-flight checks).
- *
- * <p>There is no {@code transformForRestore} counterpart — that is a follow-up implementation.
+ * SPI hook that lets a plugin transform the global metadata written into a snapshot, e.g. to re-wrap or drop encrypted project data.
  */
 public interface SnapshotGlobalStateTransformer {
 
     /**
-     * Transforms {@code metadata} before it is written into the snapshot blob. Called on the
-     * SNAPSHOT thread pool during finalization, after all shard snapshots have completed.
+     * Called on the SNAPSHOT thread pool during finalization, before the global-metadata blob is written.
      *
-     * @param projectId     the project being snapshotted
-     * @param metadata      current project metadata
-     * @param encryptedData the {@code encrypted_data} block from the original create-snapshot
-     *                      request, or {@code null} after a master failover (in which case the
-     *                      password is unavailable and encrypted data should be excluded)
-     * @return the metadata to write — same instance if no change is needed
+     * @param encryptedData the {@code encrypted_data} from the create-snapshot request, or {@code null} if none is available on this
+     *                      master (not supplied, or lost on master failover), in which case encrypted data must be excluded
+     * @return the metadata to write, or the same instance if unchanged
      */
     default Metadata transformForSnapshot(ProjectId projectId, Metadata metadata, @Nullable SnapshotEncryptedData encryptedData) {
         return metadata;
     }
 
     /**
-     * Returns {@code true} if the project metadata contains data that this transformer would
-     * re-wrap or exclude during snapshot creation. Used by
-     * {@link org.elasticsearch.action.admin.cluster.snapshots.create.TransportCreateSnapshotAction}
-     * to decide whether to emit a {@code Warning} response header when no {@code encrypted_data}
-     * was supplied with the request.
-     *
-     * @param projectId the project being snapshotted
-     * @param metadata  current project metadata
+     * Returns {@code true} if the project contains data this transformer would re-wrap or exclude.
      */
     default boolean containsEncryptedData(ProjectId projectId, Metadata metadata) {
         return false;

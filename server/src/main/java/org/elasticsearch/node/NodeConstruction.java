@@ -1266,7 +1266,7 @@ class NodeConstruction {
             snapshotMetrics
         );
 
-        // A provider is discovered once per plugin whose classloader can see it (e.g. extending plugins), so keep one per class
+        // Plugins extending the provider's plugin (e.g. esql extends encryption) also see it via their parent classloader; dedupe by class
         final var snapshotGlobalStateTransformers = pluginsService.loadServiceProviders(SnapshotGlobalStateTransformer.class)
             .stream()
             .collect(Collectors.toMap(Object::getClass, Function.identity(), (a, b) -> a, LinkedHashMap::new))

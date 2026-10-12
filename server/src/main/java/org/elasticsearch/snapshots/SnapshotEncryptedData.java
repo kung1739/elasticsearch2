@@ -41,15 +41,15 @@ public final class SnapshotEncryptedData implements Writeable {
 
     private static final int MIN_PASSWORD_LENGTH = 15;
 
-    // Reject passwords that are *entirely* a template fragment (anchored)
+    // Reject passwords that are *entirely* a template fragment via Matcher#matches
     private static final Map<Pattern, String> TEMPLATE_PATTERNS = Map.of(
-        Pattern.compile("^\\s*\\$\\{[^}]+\\}\\s*$"),
+        Pattern.compile("\\s*\\$\\{[^}]+\\}\\s*"),
         "${VAR}",
-        Pattern.compile("^\\s*\\$[A-Za-z_][A-Za-z0-9_]*\\s*$"),
+        Pattern.compile("\\s*\\$[A-Za-z_][A-Za-z0-9_]*\\s*"),
         "$VAR",
-        Pattern.compile("^\\s*\\{\\{[^}]+\\}\\}\\s*$"),
+        Pattern.compile("\\s*\\{\\{[^}]+\\}\\}\\s*"),
         "{{ .var }}",
-        Pattern.compile("^\\s*%[A-Za-z_][A-Za-z0-9_]*%\\s*$"),
+        Pattern.compile("\\s*%[A-Za-z_][A-Za-z0-9_]*%\\s*"),
         "%VAR%"
     );
     private static final String TEMPLATE_EXAMPLES = TEMPLATE_PATTERNS.values().stream().sorted().collect(Collectors.joining(", "));
