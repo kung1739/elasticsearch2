@@ -52,6 +52,7 @@ import static org.elasticsearch.test.TaskAssertions.assertAllTasksHaveFinished;
 import static org.elasticsearch.test.TaskAssertions.awaitTaskWithPrefix;
 import static org.hamcrest.Matchers.empty;
 import static org.hamcrest.Matchers.not;
+import org.elasticsearch.cluster.routing.SplitShardCountSummary;
 
 /**
  * Base class for testing that cancellation works at the REST layer for requests that need to acquire a searcher on one or more shards.
@@ -158,7 +159,12 @@ public abstract class BlockedSearcherRestCancellationTestCase extends HttpSmokeT
         }
 
         @Override
-        public Searcher acquireSearcher(String source, SearcherScope scope, Function<Searcher, Searcher> wrapper) throws EngineException {
+        public Searcher acquireSearcher(
+            String source,
+            SearcherScope scope,
+            org.elasticsearch.cluster.routing.SplitShardCountSummary splitShardCountSummary,
+            Function<Searcher, Searcher> wrapper
+        ) throws EngineException {
             if (blockedSearcherRestCancellationTestCaseLogger.isDebugEnabled()) {
                 blockedSearcherRestCancellationTestCaseLogger.debug(
                     Strings.format(
@@ -189,7 +195,7 @@ public abstract class BlockedSearcherRestCancellationTestCase extends HttpSmokeT
                 );
             }
 
-            return super.acquireSearcher(source, scope, wrapper);
+            return super.acquireSearcher(source, scope, splitShardCountSummary, wrapper);
         }
     }
 

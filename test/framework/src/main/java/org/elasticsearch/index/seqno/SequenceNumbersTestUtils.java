@@ -32,6 +32,8 @@ import static org.elasticsearch.test.ESTestCase.safeGet;
 import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.not;
 import static org.hamcrest.Matchers.notNullValue;
+import org.elasticsearch.cluster.routing.SplitShardCountSummary;
+import java.util.function.Function;
 
 /**
  * Utilities for asserting on sequence number fields at the Lucene level in integration tests.
@@ -75,7 +77,7 @@ public final class SequenceNumbersTestUtils {
             final var shardId = indexShard.shardId();
             var checked = indexShard.withEngineOrNull(engine -> {
                 if (engine != null) {
-                    try (var searcher = engine.acquireSearcher("assert_seq_no_dv")) {
+                    try (var searcher = engine.acquireSearcher("assert_seq_no_dv", Engine.SearcherScope.EXTERNAL, SplitShardCountSummary.IRRELEVANT, Function.identity())) {
                         for (var leaf : searcher.getLeafContexts()) {
                             var leafReader = leaf.reader();
                             NumericDocValues seqNoDV = leafReader.getNumericDocValues(SeqNoFieldMapper.NAME);
@@ -153,7 +155,7 @@ public final class SequenceNumbersTestUtils {
                         if (engine == null) {
                             return null;
                         }
-                        try (var searcher = engine.acquireSearcher("assert_seq_no_count")) {
+                        try (var searcher = engine.acquireSearcher("assert_seq_no_count", Engine.SearcherScope.EXTERNAL, SplitShardCountSummary.IRRELEVANT, Function.identity())) {
                             long total = 0;
                             for (var leaf : searcher.getLeafContexts()) {
                                 NumericDocValues seqNoDV = leaf.reader().getNumericDocValues(SeqNoFieldMapper.NAME);

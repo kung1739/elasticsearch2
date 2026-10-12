@@ -96,6 +96,8 @@ import static org.hamcrest.Matchers.hasSize;
 import static org.hamcrest.Matchers.is;
 import static org.hamcrest.Matchers.notNullValue;
 import static org.hamcrest.Matchers.nullValue;
+import org.elasticsearch.cluster.routing.SplitShardCountSummary;
+import java.util.function.Function;
 
 public class TransformCCSCanMatchIT extends AbstractMultiClustersTestCase {
 
@@ -608,7 +610,7 @@ public class TransformCCSCanMatchIT extends AbstractMultiClustersTestCase {
 
         @Override
         public ShardLongFieldRange getRawFieldRange(String field) {
-            try (Searcher searcher = acquireSearcher("test")) {
+            try (Searcher searcher = acquireSearcher("test", SearcherScope.EXTERNAL, SplitShardCountSummary.IRRELEVANT, Function.identity())) {
                 final DirectoryReader directoryReader = searcher.getDirectoryReader();
 
                 final byte[] minPackedValue = PointValues.getMinPackedValue(directoryReader, field);

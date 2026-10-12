@@ -33,6 +33,8 @@ import java.util.Arrays;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Set;
+import org.elasticsearch.cluster.routing.SplitShardCountSummary;
+import java.util.function.Function;
 
 public final class EngineTestUtils {
 
@@ -52,7 +54,7 @@ public final class EngineTestUtils {
         }
         final MapperService mapperService = engine.getEngineConfig().getMapperService();
         final boolean columnarId = mapperService != null && mapperService.isUseColumnarId();
-        try (Engine.Searcher searcher = engine.acquireSearcher("test_get_doc_ids", Engine.SearcherScope.INTERNAL)) {
+        try (Engine.Searcher searcher = engine.acquireSearcher("test_get_doc_ids", Engine.SearcherScope.INTERNAL, SplitShardCountSummary.IRRELEVANT, Function.identity())) {
             List<DocIdSeqNoAndSource> docs = new ArrayList<>();
             for (LeafReaderContext leafContext : searcher.getIndexReader().leaves()) {
                 LeafReader reader = leafContext.reader();

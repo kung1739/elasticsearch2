@@ -130,6 +130,7 @@ import static org.hamcrest.Matchers.lessThanOrEqualTo;
 import static org.hamcrest.Matchers.not;
 import static org.hamcrest.Matchers.notNullValue;
 import static org.hamcrest.Matchers.nullValue;
+import org.elasticsearch.cluster.routing.SplitShardCountSummary;
 
 /**
  * Test suite for time series indices that use synthetic ids for documents.
@@ -2072,7 +2073,7 @@ public class TSDBSyntheticIdsIT extends ESIntegTestCase {
         final int nbVisitedShards = internalCluster().forEveryIndexShard(indices, indexShard -> {
             long size = indexShard.withEngineOrNull(engine -> {
                 if (engine != null) {
-                    try (var searcher = engine.acquireSearcher("assert_no_id_stored_field")) {
+                    try (var searcher = engine.acquireSearcher("assert_no_id_stored_field", Engine.SearcherScope.EXTERNAL, SplitShardCountSummary.IRRELEVANT, Function.identity())) {
                         long segmentsTotalSize = 0L;
 
                         for (var leaf : searcher.getLeafContexts()) {
@@ -2140,7 +2141,7 @@ public class TSDBSyntheticIdsIT extends ESIntegTestCase {
                         nbVisitedShards += indexShard.withEngineOrNull(engine -> {
                             if (engine != null) {
                                 assertThat(engine.config().getCodec().getName(), equalTo(Elasticsearch96Codec.NAME));
-                                try (var searcher = engine.acquireSearcher("test_codec")) {
+                                try (var searcher = engine.acquireSearcher("test_codec", Engine.SearcherScope.EXTERNAL, SplitShardCountSummary.IRRELEVANT, Function.identity())) {
                                     for (var leaf : searcher.getLeafContexts()) {
                                         var segInfo = Lucene.segmentReader(leaf.reader()).getSegmentInfo().info;
                                         assertThat(

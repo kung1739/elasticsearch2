@@ -100,6 +100,8 @@ import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
+import org.elasticsearch.cluster.routing.SplitShardCountSummary;
+import java.util.function.Function;
 
 public class IndexEngineTests extends AbstractEngineTestCase {
 
@@ -382,7 +384,7 @@ public class IndexEngineTests extends AbstractEngineTestCase {
             NavigableMap<Long, Engine.Searcher> searchers = new TreeMap<>();
             for (int i = 0; i < commits; ++i) {
                 if (randomBoolean()) {
-                    searchers.put(i + gen, engine.acquireSearcher("test"));
+                    searchers.put(i + gen, engine.acquireSearcher("test", Engine.SearcherScope.EXTERNAL, SplitShardCountSummary.IRRELEVANT, Function.identity()));
                 }
                 engine.index(randomDoc(String.valueOf(i + 1)));
                 engine.flush(true, true);

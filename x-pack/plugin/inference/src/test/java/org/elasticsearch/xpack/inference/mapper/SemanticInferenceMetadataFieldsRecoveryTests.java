@@ -49,6 +49,8 @@ import static org.elasticsearch.xpack.inference.mapper.SemanticTextFieldTests.ra
 import static org.elasticsearch.xpack.inference.mapper.SemanticTextFieldTests.randomChunkedInferenceEmbeddingSparse;
 import static org.elasticsearch.xpack.inference.mapper.SemanticTextFieldTests.semanticTextFieldFromChunkedInferenceResults;
 import static org.hamcrest.Matchers.equalTo;
+import org.elasticsearch.cluster.routing.SplitShardCountSummary;
+import java.util.function.Function;
 
 public class SemanticInferenceMetadataFieldsRecoveryTests extends EngineTestCase {
     private final Model model1;
@@ -178,7 +180,7 @@ public class SemanticInferenceMetadataFieldsRecoveryTests extends EngineTestCase
         }
         engine.flush();
 
-        var searcher = engine.acquireSearcher("test", Engine.SearcherScope.INTERNAL);
+        var searcher = engine.acquireSearcher("test", Engine.SearcherScope.INTERNAL, SplitShardCountSummary.IRRELEVANT, Function.identity());
         try (
             var snapshot = newRandomSnapshot(
                 engine.config().getMapperService(),

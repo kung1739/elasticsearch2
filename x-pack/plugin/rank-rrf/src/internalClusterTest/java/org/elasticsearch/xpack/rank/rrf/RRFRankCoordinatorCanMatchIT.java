@@ -36,6 +36,8 @@ import java.util.Optional;
 
 import static org.elasticsearch.test.hamcrest.ElasticsearchAssertions.assertAcked;
 import static org.elasticsearch.test.hamcrest.ElasticsearchAssertions.assertResponse;
+import org.elasticsearch.cluster.routing.SplitShardCountSummary;
+import java.util.function.Function;
 
 @ESIntegTestCase.ClusterScope(maxNumDataNodes = 3)
 @ESIntegTestCase.SuiteScopeTestCase
@@ -49,7 +51,7 @@ public class RRFRankCoordinatorCanMatchIT extends ESIntegTestCase {
 
         @Override
         public ShardLongFieldRange getRawFieldRange(String field) {
-            try (Searcher searcher = acquireSearcher("rrf_rank_can_match_it")) {
+            try (Searcher searcher = acquireSearcher("rrf_rank_can_match_it", SearcherScope.EXTERNAL, SplitShardCountSummary.IRRELEVANT, Function.identity())) {
                 final DirectoryReader directoryReader = searcher.getDirectoryReader();
 
                 final byte[] minPackedValue = PointValues.getMinPackedValue(directoryReader, field);

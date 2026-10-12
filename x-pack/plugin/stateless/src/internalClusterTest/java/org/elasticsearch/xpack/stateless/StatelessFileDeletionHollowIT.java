@@ -12,6 +12,7 @@ import org.apache.lucene.search.Collector;
 import org.apache.lucene.search.LeafCollector;
 import org.apache.lucene.search.Scorable;
 import org.apache.lucene.search.ScoreMode;
+import org.elasticsearch.cluster.routing.SplitShardCountSummary;
 import org.elasticsearch.ElasticsearchException;
 import org.elasticsearch.action.delete.DeleteRequest;
 import org.elasticsearch.action.index.IndexRequest;
@@ -436,7 +437,7 @@ public class StatelessFileDeletionHollowIT extends AbstractStatelessPluginIntegT
         logLastCommittedSegmentInfos(indexShard);
 
         // Acquire commit for searcher
-        var searcher = indexShard.acquireSearcher("searcher");
+        var searcher = indexShard.acquireExternalSearcher("searcher", SplitShardCountSummary.IRRELEVANT);
         assertThat(searcher.getDirectoryReader().getIndexCommit().getGeneration(), equalTo(5L));
         assertThat(searcher.getDirectoryReader().getIndexCommit().getSegmentCount(), equalTo(2));
 

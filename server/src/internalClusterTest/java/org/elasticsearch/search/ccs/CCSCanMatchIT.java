@@ -49,6 +49,8 @@ import static org.elasticsearch.test.hamcrest.ElasticsearchAssertions.assertHitC
 import static org.elasticsearch.test.hamcrest.ElasticsearchAssertions.assertResponse;
 import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.in;
+import org.elasticsearch.cluster.routing.SplitShardCountSummary;
+import java.util.function.Function;
 
 public class CCSCanMatchIT extends AbstractCrossClusterSearchTestCase {
 
@@ -60,7 +62,7 @@ public class CCSCanMatchIT extends AbstractCrossClusterSearchTestCase {
 
         @Override
         public ShardLongFieldRange getRawFieldRange(String field) {
-            try (Searcher searcher = acquireSearcher("test")) {
+            try (Searcher searcher = acquireSearcher("test", SearcherScope.EXTERNAL, SplitShardCountSummary.IRRELEVANT, Function.identity())) {
                 final DirectoryReader directoryReader = searcher.getDirectoryReader();
 
                 final byte[] minPackedValue = PointValues.getMinPackedValue(directoryReader, field);

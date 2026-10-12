@@ -39,6 +39,8 @@ import java.util.ArrayList;
 import java.util.List;
 
 import static org.hamcrest.Matchers.equalTo;
+import org.elasticsearch.cluster.routing.SplitShardCountSummary;
+import java.util.function.Function;
 
 public class SyntheticVectorFieldsRecoveryTests extends EngineTestCase {
     private final boolean useSynthetic;
@@ -170,7 +172,7 @@ public class SyntheticVectorFieldsRecoveryTests extends EngineTestCase {
         }
         engine.flush();
 
-        var searcher = engine.acquireSearcher("test", Engine.SearcherScope.INTERNAL);
+        var searcher = engine.acquireSearcher("test", Engine.SearcherScope.INTERNAL, SplitShardCountSummary.IRRELEVANT, Function.identity());
         try (
             var snapshot = newRandomSnapshot(
                 engine.config().getMapperService(),

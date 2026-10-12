@@ -12,6 +12,7 @@ import com.carrotsearch.randomizedtesting.annotations.ParametersFactory;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.apache.lucene.index.BinaryDocValues;
+import org.elasticsearch.cluster.routing.SplitShardCountSummary;
 import org.elasticsearch.action.DocWriteRequest;
 import org.elasticsearch.action.admin.indices.create.CreateIndexRequest;
 import org.elasticsearch.action.admin.indices.refresh.RefreshRequest;
@@ -154,7 +155,7 @@ public class PatternTextIntegrationTests extends ESSingleNodeTestCase {
         assertMappings();
         assertMessagesInSource(messages);
 
-        try (var searcher = indexService.getShard(0).acquireSearcher(INDEX)) {
+        try (var searcher = indexService.getShard(0).acquireExternalSearcher(INDEX, SplitShardCountSummary.IRRELEVANT)) {
             try (var indexReader = searcher.getIndexReader()) {
                 if (useBinaryDocValues) {
                     var leafReader = indexReader.leaves().get(0).reader();
@@ -181,7 +182,7 @@ public class PatternTextIntegrationTests extends ESSingleNodeTestCase {
         assertMappings();
         assertMessagesInSource(messages);
 
-        try (var searcher = indexService.getShard(0).acquireSearcher(INDEX)) {
+        try (var searcher = indexService.getShard(0).acquireExternalSearcher(INDEX, SplitShardCountSummary.IRRELEVANT)) {
             try (var indexReader = searcher.getIndexReader()) {
                 if (disableTemplating) {
                     // when templating is disabled, large values are either stored in binary doc values or stored fields

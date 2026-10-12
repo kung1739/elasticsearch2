@@ -9,6 +9,7 @@ package org.elasticsearch.xpack.spatial.index.mapper;
 
 import org.apache.lucene.index.FieldInfo;
 import org.apache.lucene.index.FieldInfos;
+import org.elasticsearch.cluster.routing.SplitShardCountSummary;
 import org.elasticsearch.action.DocWriteRequest;
 import org.elasticsearch.action.admin.indices.refresh.RefreshRequest;
 import org.elasticsearch.action.bulk.BulkRequest;
@@ -62,7 +63,7 @@ public class GeoShapeDocValueFormatTests extends ESSingleNodeTestCase {
         assertFalse(response.hasFailures());
         safeGet(indicesAdmin().refresh(new RefreshRequest(indexName).indicesOptions(IndicesOptions.lenientExpandOpenHidden())));
 
-        try (var searcher = indexService.getShard(0).acquireSearcher(indexName)) {
+        try (var searcher = indexService.getShard(0).acquireExternalSearcher(indexName, SplitShardCountSummary.IRRELEVANT)) {
             try (var indexReader = searcher.getIndexReader()) {
                 var leaves = indexReader.leaves();
                 assertThat(leaves.size(), equalTo(1));

@@ -157,6 +157,7 @@ import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.greaterThanOrEqualTo;
 import static org.hamcrest.Matchers.lessThanOrEqualTo;
 import static org.hamcrest.Matchers.notNullValue;
+import org.elasticsearch.cluster.routing.SplitShardCountSummary;
 
 @SuppressWarnings("HiddenField")
 public abstract class EngineTestCase extends ESTestCase {
@@ -966,7 +967,7 @@ public abstract class EngineTestCase extends ESTestCase {
         if (refresh) {
             engine.refresh("test");
         }
-        try (Engine.Searcher searcher = engine.acquireSearcher("test")) {
+        try (Engine.Searcher searcher = engine.acquireSearcher("test", Engine.SearcherScope.EXTERNAL, SplitShardCountSummary.IRRELEVANT, Function.identity())) {
             Integer totalHits = searcher.search(Queries.ALL_DOCS_INSTANCE, new TotalHitCountCollectorManager(searcher.getSlices()));
             assertThat(totalHits, equalTo(numDocs));
         }
@@ -1183,7 +1184,7 @@ public abstract class EngineTestCase extends ESTestCase {
 
         assertVisibleCount(replicaEngine, lastFieldValue == null ? 0 : 1);
         if (lastFieldValue != null) {
-            try (Engine.Searcher searcher = replicaEngine.acquireSearcher("test")) {
+            try (Engine.Searcher searcher = replicaEngine.acquireSearcher("test", Engine.SearcherScope.EXTERNAL, SplitShardCountSummary.IRRELEVANT, Function.identity())) {
                 Integer totalHits = searcher.search(
                     new TermQuery(new Term("value", lastFieldValue)),
                     new TotalHitCountCollectorManager(searcher.getSlices())
@@ -1376,7 +1377,7 @@ public abstract class EngineTestCase extends ESTestCase {
         if (engine instanceof InternalEngine) {
             try {
                 engine.refresh("test");
-                try (Engine.Searcher searcher = engine.acquireSearcher("test")) {
+                try (Engine.Searcher searcher = engine.acquireSearcher("test", Engine.SearcherScope.EXTERNAL, SplitShardCountSummary.IRRELEVANT, Function.identity())) {
                     var indexSettings = engine.config().getIndexSettings();
                     var mapperService = engine.config().getMapperService();
                     assertAtMostOneLuceneDocumentPerSequenceNumber(indexSettings, mapperService, searcher.getDirectoryReader());
@@ -1609,7 +1610,7 @@ public abstract class EngineTestCase extends ESTestCase {
         if (readOnlyEngine.lazilyLoadSoftDeletes == false) {
             throw new IllegalStateException("method should only be called when lazily loading soft-deletes is enabled");
         }
-        try (Engine.Searcher searcher = readOnlyEngine.acquireSearcher("soft-deletes-check", Engine.SearcherScope.INTERNAL)) {
+        try (Engine.Searcher searcher = readOnlyEngine.acquireSearcher("soft-deletes-check", Engine.SearcherScope.INTERNAL, SplitShardCountSummary.IRRELEVANT, Function.identity())) {
             for (LeafReaderContext ctx : searcher.getIndexReader().getContext().leaves()) {
                 LazySoftDeletesDirectoryReaderWrapper.LazyBits lazyBits = lazyBits(ctx.reader());
                 if (lazyBits != null && lazyBits.initialized()) {
