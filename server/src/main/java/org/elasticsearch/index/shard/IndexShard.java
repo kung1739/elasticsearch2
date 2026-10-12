@@ -1045,8 +1045,8 @@ public class IndexShard extends AbstractIndexShardComponent implements IndicesCl
 
     /**
      * Apply an in-place doc-values update on the primary (see {@code doc_values.updatable}). {@code version} is the current version of
-     * the document, carried through so the replica records the same value. There is no optimistic-concurrency check on the engine side,
-     * so doc-values updates are last-writer-wins (the {@code if_seq_no} check is enforced earlier, in the update helper).
+     * the document, carried through so the replica records the same value. The {@code if_seq_no}/{@code if_primary_term} check is
+     * enforced earlier, in the update helper, so the engine applies the update without an optimistic-concurrency check of its own.
      */
     public Engine.DocValuesUpdateResult applyDocValuesUpdateOnPrimary(
         long version,

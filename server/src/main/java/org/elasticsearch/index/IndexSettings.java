@@ -2670,10 +2670,10 @@ public final class IndexSettings {
     }
 
     /**
-     * Whether in-place doc-values updates on this index must advance the document's optimistic-concurrency identity through the
-     * {@code _dv_update_seq_no}/{@code _dv_update_primary_term} companion columns (see {@link SeqNoFieldMapper}). Only strict columnar
-     * indices support in-place updates, and only when sequence numbers are kept is there any optimistic concurrency to preserve; on
-     * sequence-number-disabled indices (e.g. columnar data streams) the update stays last-writer-wins and needs no companion columns.
+     * Whether in-place doc-values updates on this index advance the document's optimistic-concurrency identity through the
+     * {@code _dv_update_seq_no}/{@code _dv_update_primary_term} companion columns (see {@link SeqNoFieldMapper}). True for strict
+     * columnar indices that keep sequence numbers. Updatable fields are rejected when sequence numbers are disabled, so any index that
+     * has them always has this enabled.
      */
     public boolean seqNoAwareDocValuesUpdates() {
         return disableSequenceNumbers == false && getMode().isStrictColumnar();

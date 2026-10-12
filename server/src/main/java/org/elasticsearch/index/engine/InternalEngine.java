@@ -2372,10 +2372,9 @@ public class InternalEngine extends Engine {
         // safely from here on, exactly as for deletes and regular updates.
         versionMap.enforceSafeAccess();
         assert assertIncomingSequenceNumber(docValuesUpdate.origin(), docValuesUpdate.seqNo());
-        // On a sequence-number-aware index an in-place update advances the document's sequence number and primary term so optimistic
-        // concurrency and realtime get stay correct; on a sequence-number-disabled index it stays last-writer-wins and leaves the
-        // identity untouched (see IndexShard#applyDocValuesUpdateOnPrimary). The version is left unchanged in both cases: it is the
-        // observable signal that a change took the in-place path rather than a reindex.
+        // An in-place update advances the document's sequence number and primary term through the companion columns so optimistic
+        // concurrency and realtime get stay correct. The version is left unchanged: it is the observable signal that a change took the
+        // in-place path rather than a reindex.
         final boolean seqNoAware = engineConfig.getIndexSettings().seqNoAwareDocValuesUpdates();
         DocValuesUpdate op = docValuesUpdate;
         DocValuesUpdateResult result;

@@ -739,9 +739,8 @@ public class TransportShardBulkAction extends TransportWriteAction<BulkShardRequ
                 // doc-values update.
                 final IndexResponse indexResponse = operationResponse.getResponse();
                 // For an in-place doc-values update the IndexResponse already carries the operation's seq_no, primary term and bumped
-                // version, which are the document's new identity after the update on a sequence-number-aware index (on a
-                // sequence-number-disabled index the update is last-writer-wins and these stay unassigned/unchanged). Report them
-                // directly so a follow-up if_seq_no matches the current document.
+                // version, which are the document's new identity after the update. Report them directly so a follow-up if_seq_no matches
+                // the current document.
                 updateResponse = new UpdateResponse(
                     indexResponse.getShardInfo(),
                     indexResponse.getShardId(),
