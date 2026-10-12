@@ -87,10 +87,12 @@ import java.util.function.IntFunction;
  *       whole-number exact parse above is the same refuse-vs-cast pattern for numeric columns;</li>
  *   <li><b>{@code datetime}</b>: string sources parse via {@link #parseDatetimeMillis} with the
  *       column's declared {@code format} (else the ISO default). A {@code date_nanos} source narrows
- *       nanos&rarr;millis ({@link DateUtils#toMilliSeconds}, truncating sub-millisecond precision) —
- *       the narrowing {@code ::datetime} performs. This is what lets an annotated
+ *       nanos&rarr;millis by floor division, losing sub-millisecond precision but never failing —
+ *       including below the epoch, where {@code ::datetime} nulls the value instead, because that
+ *       bound belongs to {@code date_nanos} and not to {@code date}. This is what lets an annotated
  *       {@code TIMESTAMP(MICROS|NANOS)} column (which infers as {@code date_nanos}) be declared
- *       {@code date}, the conventional dashboard type. Numeric sources follow the unit rule below
+ *       {@code date}, the conventional dashboard type, for the whole range {@code date} represents.
+ *       Numeric sources follow the unit rule below
  *       ({@code date} = millis when no format is declared; a {@code double} rounds to the nearest
  *       milli, the {@code ::datetime} semantic);</li>
  *   <li><b>{@code date_nanos}</b>: string sources parse via the column's declared {@code format}
@@ -169,6 +171,9 @@ import java.util.function.IntFunction;
  * on the same capability surface.
  */
 public final class DeclaredTypeCoercions {
+
+    /** Nanoseconds per millisecond: the divisor of the {@code date_nanos -> date} narrowing. */
+    private static final long NANOS_PER_MILLI = 1_000_000L;
 
     private DeclaredTypeCoercions() {}
 
@@ -558,11 +563,23 @@ public final class DeclaredTypeCoercions {
                 }
                 if (from == DataType.DATE_NANOS) {
                     // An annotated TIMESTAMP(MICROS|NANOS) column infers as date_nanos; declaring it `date` narrows
-                    // nanos -> millis, truncating sub-millisecond precision. Value-identical to ::datetime, which maps
-                    // DATE_NANOS through this same DateUtils.toMilliSeconds (ToDatetime's DATE_NANOS evaluator), so a
-                    // declared read and an explicit cast cannot disagree. A pre-epoch nanos instant throws and follows
-                    // the read's error policy. No format is involved: the annotation already states the unit.
-                    yield v -> DateUtils.toMilliSeconds((Long) v);
+                    // nanos -> millis, losing sub-millisecond precision. The narrowing is arithmetic and total: every
+                    // value a date_nanos block can hold is a representable epoch-millis instant, so it cannot fail,
+                    // and it must not borrow date_nanos' own 1970 floor. DateUtils.toMilliSeconds throws below the
+                    // epoch because epoch-nanos start at 1970, which is a fact about the SOURCE type, not about
+                    // `date`; that floor made a pre-1970 TIMESTAMP(MICROS) column fail the whole read while the same
+                    // column read correctly with no declaration at all.
+                    //
+                    // Floor division, not truncation toward zero: rawBoundFor's ScaleDown arithmetic -- the bounds the
+                    // planner pushes for this very column -- is derived from `decoded == floorDiv(raw, d)`, so
+                    // truncating would make the decode disagree with the pruning and skip row groups the query
+                    // matches.
+                    //
+                    // This is where a declared read diverges from ::datetime, which maps DATE_NANOS through
+                    // DateUtils.toMilliSeconds and so nulls a pre-epoch instant. The declared coercions answer to the
+                    // field mappers (see the class javadoc), and a `date` mapper ingests the instant happily. No
+                    // format is involved: the annotation already states the unit.
+                    yield v -> Math.floorDiv((Long) v, NANOS_PER_MILLI);
                 }
                 if (from == DataType.DOUBLE) {
                     // A declared double column reads as an epoch value the same way ::datetime treats a double
