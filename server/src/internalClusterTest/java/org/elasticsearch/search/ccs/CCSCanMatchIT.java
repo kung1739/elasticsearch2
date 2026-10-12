@@ -19,6 +19,7 @@ import org.elasticsearch.client.internal.Client;
 import org.elasticsearch.cluster.metadata.IndexMetadata;
 import org.elasticsearch.cluster.node.DiscoveryNode;
 import org.elasticsearch.cluster.node.DiscoveryNodes;
+import org.elasticsearch.cluster.routing.SplitShardCountSummary;
 import org.elasticsearch.common.Strings;
 import org.elasticsearch.common.settings.Settings;
 import org.elasticsearch.common.util.CollectionUtils;
@@ -43,14 +44,13 @@ import java.util.Arrays;
 import java.util.Collection;
 import java.util.List;
 import java.util.Optional;
+import java.util.function.Function;
 
 import static org.elasticsearch.test.hamcrest.ElasticsearchAssertions.assertAcked;
 import static org.elasticsearch.test.hamcrest.ElasticsearchAssertions.assertHitCount;
 import static org.elasticsearch.test.hamcrest.ElasticsearchAssertions.assertResponse;
 import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.in;
-import org.elasticsearch.cluster.routing.SplitShardCountSummary;
-import java.util.function.Function;
 
 public class CCSCanMatchIT extends AbstractCrossClusterSearchTestCase {
 
@@ -62,7 +62,9 @@ public class CCSCanMatchIT extends AbstractCrossClusterSearchTestCase {
 
         @Override
         public ShardLongFieldRange getRawFieldRange(String field) {
-            try (Searcher searcher = acquireSearcher("test", SearcherScope.EXTERNAL, SplitShardCountSummary.IRRELEVANT, Function.identity())) {
+            try (
+                Searcher searcher = acquireSearcher("test", SearcherScope.EXTERNAL, SplitShardCountSummary.IRRELEVANT, Function.identity())
+            ) {
                 final DirectoryReader directoryReader = searcher.getDirectoryReader();
 
                 final byte[] minPackedValue = PointValues.getMinPackedValue(directoryReader, field);

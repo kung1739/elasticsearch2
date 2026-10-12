@@ -252,7 +252,14 @@ public abstract class Engine implements Closeable {
         // index.refresh_interval=-1 won't see any doc stats updates at all. This change will give more accurate statistics
         // when indexing but not refreshing in general. Yet, if a refresh happens the internal searcher is refresh as well so we are
         // safe here.
-        try (Searcher searcher = acquireSearcher(DOC_STATS_SOURCE, SearcherScope.INTERNAL, SplitShardCountSummary.IRRELEVANT, Function.identity())) {
+        try (
+            Searcher searcher = acquireSearcher(
+                DOC_STATS_SOURCE,
+                SearcherScope.INTERNAL,
+                SplitShardCountSummary.IRRELEVANT,
+                Function.identity()
+            )
+        ) {
             return docsStats(searcher.getIndexReader());
         }
     }
@@ -282,7 +289,14 @@ public abstract class Engine implements Closeable {
      * @throws AlreadyClosedException if the shard is closed
      */
     public ShardFieldStats shardFieldStats() {
-        try (var searcher = acquireSearcher("shard_field_stats", Engine.SearcherScope.INTERNAL, SplitShardCountSummary.IRRELEVANT, Function.identity())) {
+        try (
+            var searcher = acquireSearcher(
+                "shard_field_stats",
+                Engine.SearcherScope.INTERNAL,
+                SplitShardCountSummary.IRRELEVANT,
+                Function.identity()
+            )
+        ) {
             return shardFieldStats(searcher.getLeafContexts(), isStateless);
         }
     }
@@ -291,7 +305,14 @@ public abstract class Engine implements Closeable {
      * @throws AlreadyClosedException if the shard is closed
      */
     public FieldInfos shardFieldInfos() {
-        try (var searcher = acquireSearcher(FIELD_HAS_VALUE_SOURCE, SearcherScope.EXTERNAL, SplitShardCountSummary.IRRELEVANT, Function.identity())) {
+        try (
+            var searcher = acquireSearcher(
+                FIELD_HAS_VALUE_SOURCE,
+                SearcherScope.EXTERNAL,
+                SplitShardCountSummary.IRRELEVANT,
+                Function.identity()
+            )
+        ) {
             return FieldInfos.getMergedFieldInfos(searcher.getIndexReader());
         }
     }
@@ -405,7 +426,14 @@ public abstract class Engine implements Closeable {
         if (fields.isEmpty()) {
             return new DenseVectorStats(0);
         }
-        try (Searcher searcher = acquireSearcher(DOC_STATS_SOURCE, SearcherScope.INTERNAL, SplitShardCountSummary.IRRELEVANT, Function.identity())) {
+        try (
+            Searcher searcher = acquireSearcher(
+                DOC_STATS_SOURCE,
+                SearcherScope.INTERNAL,
+                SplitShardCountSummary.IRRELEVANT,
+                Function.identity()
+            )
+        ) {
             return denseVectorStats(searcher.getIndexReader(), fields);
         }
     }
@@ -447,7 +475,14 @@ public abstract class Engine implements Closeable {
             return new SparseVectorStats(0);
         }
         Collections.sort(fields);
-        try (Searcher searcher = acquireSearcher(DOC_STATS_SOURCE, SearcherScope.INTERNAL, SplitShardCountSummary.IRRELEVANT, Function.identity())) {
+        try (
+            Searcher searcher = acquireSearcher(
+                DOC_STATS_SOURCE,
+                SearcherScope.INTERNAL,
+                SplitShardCountSummary.IRRELEVANT,
+                Function.identity()
+            )
+        ) {
             return sparseVectorStats(searcher.getIndexReader(), fields);
         }
     }
@@ -1293,7 +1328,14 @@ public abstract class Engine implements Closeable {
         ensureOpen();
         Set<String> segmentName = new HashSet<>();
         SegmentsStats stats = new SegmentsStats();
-        try (Searcher searcher = acquireSearcher(SEGMENTS_STATS_SOURCE, SearcherScope.INTERNAL, SplitShardCountSummary.IRRELEVANT, Function.identity())) {
+        try (
+            Searcher searcher = acquireSearcher(
+                SEGMENTS_STATS_SOURCE,
+                SearcherScope.INTERNAL,
+                SplitShardCountSummary.IRRELEVANT,
+                Function.identity()
+            )
+        ) {
             for (LeafReaderContext ctx : searcher.getIndexReader().getContext().leaves()) {
                 SegmentReader segmentReader = Lucene.segmentReader(ctx.reader());
                 fillSegmentStats(segmentReader, includeSegmentFileSizes, stats);
@@ -1301,7 +1343,14 @@ public abstract class Engine implements Closeable {
             }
         }
 
-        try (Searcher searcher = acquireSearcher(SEGMENTS_STATS_SOURCE, SearcherScope.EXTERNAL, SplitShardCountSummary.IRRELEVANT, Function.identity())) {
+        try (
+            Searcher searcher = acquireSearcher(
+                SEGMENTS_STATS_SOURCE,
+                SearcherScope.EXTERNAL,
+                SplitShardCountSummary.IRRELEVANT,
+                Function.identity()
+            )
+        ) {
             for (LeafReaderContext ctx : searcher.getIndexReader().getContext().leaves()) {
                 SegmentReader segmentReader = Lucene.segmentReader(ctx.reader());
                 if (segmentName.contains(segmentReader.getSegmentName()) == false) {
@@ -1374,13 +1423,17 @@ public abstract class Engine implements Closeable {
         ensureOpen();
         Map<String, Segment> segments = new HashMap<>();
         // first, go over and compute the search ones...
-        try (Searcher searcher = acquireSearcher("segments", SearcherScope.EXTERNAL, SplitShardCountSummary.IRRELEVANT, Function.identity())) {
+        try (
+            Searcher searcher = acquireSearcher("segments", SearcherScope.EXTERNAL, SplitShardCountSummary.IRRELEVANT, Function.identity())
+        ) {
             for (LeafReaderContext ctx : searcher.getIndexReader().getContext().leaves()) {
                 fillSegmentInfo(Lucene.segmentReader(ctx.reader()), true, segments, includeVectorFormatsInfo, includeAutoCalibration);
             }
         }
 
-        try (Searcher searcher = acquireSearcher("segments", SearcherScope.INTERNAL, SplitShardCountSummary.IRRELEVANT, Function.identity())) {
+        try (
+            Searcher searcher = acquireSearcher("segments", SearcherScope.INTERNAL, SplitShardCountSummary.IRRELEVANT, Function.identity())
+        ) {
             for (LeafReaderContext ctx : searcher.getIndexReader().getContext().leaves()) {
                 SegmentReader segmentReader = Lucene.segmentReader(ctx.reader());
                 if (segments.containsKey(segmentReader.getSegmentName()) == false) {

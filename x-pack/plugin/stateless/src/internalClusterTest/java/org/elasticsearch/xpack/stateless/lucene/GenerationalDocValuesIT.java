@@ -26,8 +26,8 @@ import org.elasticsearch.action.bulk.BulkRequestBuilder;
 import org.elasticsearch.action.support.PlainActionFuture;
 import org.elasticsearch.client.internal.Client;
 import org.elasticsearch.cluster.metadata.IndexMetadata;
-import org.elasticsearch.cluster.service.ClusterService;
 import org.elasticsearch.cluster.routing.SplitShardCountSummary;
+import org.elasticsearch.cluster.service.ClusterService;
 import org.elasticsearch.common.CheckedSupplier;
 import org.elasticsearch.common.blobstore.OperationPurpose;
 import org.elasticsearch.common.settings.Settings;
@@ -1365,7 +1365,14 @@ public class GenerationalDocValuesIT extends AbstractStatelessPluginIntegTestCas
             var searchEngineTermAndGen = SearchEngineTestUtils.getCurrentPrimaryTermAndGeneration(searchEngine);
             assertThat(searchEngineTermAndGen.generation(), matcher);
 
-            try (var searcher = searchEngine.acquireSearcher("search_engine_directory_reader_generation", Engine.SearcherScope.EXTERNAL, SplitShardCountSummary.IRRELEVANT, Function.identity())) {
+            try (
+                var searcher = searchEngine.acquireSearcher(
+                    "search_engine_directory_reader_generation",
+                    Engine.SearcherScope.EXTERNAL,
+                    SplitShardCountSummary.IRRELEVANT,
+                    Function.identity()
+                )
+            ) {
                 assertThat(searcher.getDirectoryReader().getIndexCommit().getGeneration(), matcher);
             }
         });

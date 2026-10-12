@@ -17,6 +17,7 @@ import org.apache.lucene.search.IndexSearcher;
 import org.apache.lucene.search.Query;
 import org.apache.lucene.search.TopDocs;
 import org.elasticsearch.ElasticsearchStatusException;
+import org.elasticsearch.cluster.routing.SplitShardCountSummary;
 import org.elasticsearch.common.lucene.Lucene;
 import org.elasticsearch.core.Assertions;
 import org.elasticsearch.index.VersionType;
@@ -31,8 +32,6 @@ import org.elasticsearch.xpack.ccr.CcrSettings;
 import java.io.IOException;
 import java.util.List;
 import java.util.Optional;
-import org.elasticsearch.cluster.routing.SplitShardCountSummary;
-
 import java.util.OptionalLong;
 import java.util.function.Function;
 
@@ -195,7 +194,14 @@ public class FollowingEngine extends InternalEngine {
             return OptionalLong.empty();
         }
         refreshIfNeeded("lookup_primary_term", seqNo);
-        try (Searcher engineSearcher = acquireSearcher("lookup_primary_term", SearcherScope.INTERNAL, SplitShardCountSummary.IRRELEVANT, Function.identity())) {
+        try (
+            Searcher engineSearcher = acquireSearcher(
+                "lookup_primary_term",
+                SearcherScope.INTERNAL,
+                SplitShardCountSummary.IRRELEVANT,
+                Function.identity()
+            )
+        ) {
             final DirectoryReader reader = Lucene.wrapAllDocsLive(engineSearcher.getDirectoryReader());
             final IndexSearcher searcher = new IndexSearcher(reader);
             searcher.setQueryCache(null);

@@ -10,8 +10,8 @@ package org.elasticsearch.percolator;
 
 import org.apache.lucene.search.Query;
 import org.apache.lucene.search.join.ScoreMode;
-import org.elasticsearch.cluster.routing.SplitShardCountSummary;
 import org.elasticsearch.action.support.WriteRequest;
+import org.elasticsearch.cluster.routing.SplitShardCountSummary;
 import org.elasticsearch.common.bytes.BytesArray;
 import org.elasticsearch.common.bytes.BytesReference;
 import org.elasticsearch.common.settings.Settings;

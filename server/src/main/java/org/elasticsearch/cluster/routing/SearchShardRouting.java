@@ -12,7 +12,6 @@ package org.elasticsearch.cluster.routing;
 import org.elasticsearch.index.shard.ShardId;
 
 import java.util.List;
-import org.elasticsearch.cluster.routing.SplitShardCountSummary;
 
 /**
  * Contains an iterator of shards for a given {@link ShardId shard id} and additional routing-related metadata needed to

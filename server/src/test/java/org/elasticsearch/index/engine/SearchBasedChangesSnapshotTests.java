@@ -10,6 +10,7 @@
 package org.elasticsearch.index.engine;
 
 import org.apache.lucene.index.NoMergePolicy;
+import org.elasticsearch.cluster.routing.SplitShardCountSummary;
 import org.elasticsearch.common.Randomness;
 import org.elasticsearch.common.Strings;
 import org.elasticsearch.common.settings.Settings;
@@ -37,13 +38,12 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.Function;
 import java.util.function.LongSupplier;
 
 import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.hasSize;
-import org.elasticsearch.cluster.routing.SplitShardCountSummary;
-import java.util.function.Function;
 
 public abstract class SearchBasedChangesSnapshotTests extends EngineTestCase {
 
@@ -147,7 +147,12 @@ public abstract class SearchBasedChangesSnapshotTests extends EngineTestCase {
             fromSeqNo = between(0, numOps);
             toSeqNo = randomLongBetween(fromSeqNo, numOps * 2);
 
-            Engine.Searcher searcher = engine.acquireSearcher("test", Engine.SearcherScope.INTERNAL, SplitShardCountSummary.IRRELEVANT, Function.identity());
+            Engine.Searcher searcher = engine.acquireSearcher(
+                "test",
+                Engine.SearcherScope.INTERNAL,
+                SplitShardCountSummary.IRRELEVANT,
+                Function.identity()
+            );
             try (
                 Translog.Snapshot snapshot = newRandomSnapshot(
                     engine.engineConfig.getMapperService(),
@@ -167,7 +172,12 @@ public abstract class SearchBasedChangesSnapshotTests extends EngineTestCase {
                 IOUtils.close(searcher);
             }
 
-            searcher = engine.acquireSearcher("test", Engine.SearcherScope.INTERNAL, SplitShardCountSummary.IRRELEVANT, Function.identity());
+            searcher = engine.acquireSearcher(
+                "test",
+                Engine.SearcherScope.INTERNAL,
+                SplitShardCountSummary.IRRELEVANT,
+                Function.identity()
+            );
             try (
                 Translog.Snapshot snapshot = newRandomSnapshot(
                     engine.engineConfig.getMapperService(),
@@ -193,7 +203,12 @@ public abstract class SearchBasedChangesSnapshotTests extends EngineTestCase {
         } else {
             fromSeqNo = randomLongBetween(0, refreshedSeqNo);
             toSeqNo = randomLongBetween(refreshedSeqNo + 1, numOps * 2);
-            Engine.Searcher searcher = engine.acquireSearcher("test", Engine.SearcherScope.INTERNAL, SplitShardCountSummary.IRRELEVANT, Function.identity());
+            Engine.Searcher searcher = engine.acquireSearcher(
+                "test",
+                Engine.SearcherScope.INTERNAL,
+                SplitShardCountSummary.IRRELEVANT,
+                Function.identity()
+            );
             try (
                 Translog.Snapshot snapshot = newRandomSnapshot(
                     engine.engineConfig.getMapperService(),
@@ -212,7 +227,12 @@ public abstract class SearchBasedChangesSnapshotTests extends EngineTestCase {
             } finally {
                 IOUtils.close(searcher);
             }
-            searcher = engine.acquireSearcher("test", Engine.SearcherScope.INTERNAL, SplitShardCountSummary.IRRELEVANT, Function.identity());
+            searcher = engine.acquireSearcher(
+                "test",
+                Engine.SearcherScope.INTERNAL,
+                SplitShardCountSummary.IRRELEVANT,
+                Function.identity()
+            );
             try (
                 Translog.Snapshot snapshot = newRandomSnapshot(
                     engine.engineConfig.getMapperService(),
@@ -236,7 +256,12 @@ public abstract class SearchBasedChangesSnapshotTests extends EngineTestCase {
                 IOUtils.close(searcher);
             }
             toSeqNo = randomLongBetween(fromSeqNo, refreshedSeqNo);
-            searcher = engine.acquireSearcher("test", Engine.SearcherScope.INTERNAL, SplitShardCountSummary.IRRELEVANT, Function.identity());
+            searcher = engine.acquireSearcher(
+                "test",
+                Engine.SearcherScope.INTERNAL,
+                SplitShardCountSummary.IRRELEVANT,
+                Function.identity()
+            );
             try (
                 Translog.Snapshot snapshot = newRandomSnapshot(
                     engine.engineConfig.getMapperService(),
@@ -299,7 +324,12 @@ public abstract class SearchBasedChangesSnapshotTests extends EngineTestCase {
         }
         long maxSeqNo = engine.getLocalCheckpointTracker().getMaxSeqNo();
         engine.refresh("test");
-        Engine.Searcher searcher = engine.acquireSearcher("test", Engine.SearcherScope.INTERNAL, SplitShardCountSummary.IRRELEVANT, Function.identity());
+        Engine.Searcher searcher = engine.acquireSearcher(
+            "test",
+            Engine.SearcherScope.INTERNAL,
+            SplitShardCountSummary.IRRELEVANT,
+            Function.identity()
+        );
         final boolean accessStats = randomBoolean();
         try (
             Translog.Snapshot snapshot = newRandomSnapshot(

@@ -234,7 +234,14 @@ public class SeqNoPruningIT extends ESIntegTestCase {
                 if (engine == null) {
                     return null;
                 }
-                try (var searcher = engine.acquireSearcher("assert_seq_no_count", Engine.SearcherScope.EXTERNAL, SplitShardCountSummary.IRRELEVANT, Function.identity())) {
+                try (
+                    var searcher = engine.acquireSearcher(
+                        "assert_seq_no_count",
+                        Engine.SearcherScope.EXTERNAL,
+                        SplitShardCountSummary.IRRELEVANT,
+                        Function.identity()
+                    )
+                ) {
                     long nbDocsWithSeqNo = 0;
                     for (var leaf : searcher.getLeafContexts()) {
                         NumericDocValues seqNoDV = leaf.reader().getNumericDocValues(SeqNoFieldMapper.NAME);

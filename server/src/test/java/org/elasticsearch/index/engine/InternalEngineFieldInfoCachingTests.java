@@ -41,7 +41,14 @@ public class InternalEngineFieldInfoCachingTests extends EngineTestCase {
         }
         engine.refresh("test");
 
-        try (Engine.Searcher searcher = engine.acquireSearcher("test", Engine.SearcherScope.EXTERNAL, SplitShardCountSummary.IRRELEVANT, Function.identity())) {
+        try (
+            Engine.Searcher searcher = engine.acquireSearcher(
+                "test",
+                Engine.SearcherScope.EXTERNAL,
+                SplitShardCountSummary.IRRELEVANT,
+                Function.identity()
+            )
+        ) {
             DirectoryReader reader = searcher.getDirectoryReader();
             assertThat("test requires multiple segments", reader.leaves().size(), Matchers.greaterThan(1));
 

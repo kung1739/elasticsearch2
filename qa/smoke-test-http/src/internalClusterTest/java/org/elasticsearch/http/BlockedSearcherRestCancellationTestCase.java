@@ -52,7 +52,6 @@ import static org.elasticsearch.test.TaskAssertions.assertAllTasksHaveFinished;
 import static org.elasticsearch.test.TaskAssertions.awaitTaskWithPrefix;
 import static org.hamcrest.Matchers.empty;
 import static org.hamcrest.Matchers.not;
-import org.elasticsearch.cluster.routing.SplitShardCountSummary;
 
 /**
  * Base class for testing that cancellation works at the REST layer for requests that need to acquire a searcher on one or more shards.

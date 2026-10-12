@@ -103,6 +103,7 @@ import org.elasticsearch.cluster.node.DiscoveryNode;
 import org.elasticsearch.cluster.routing.IndexRoutingTable;
 import org.elasticsearch.cluster.routing.IndexShardRoutingTable;
 import org.elasticsearch.cluster.routing.ShardRouting;
+import org.elasticsearch.cluster.routing.SplitShardCountSummary;
 import org.elasticsearch.cluster.routing.UnassignedInfo;
 import org.elasticsearch.cluster.routing.allocation.DiskThresholdSettings;
 import org.elasticsearch.cluster.routing.allocation.decider.EnableAllocationDecider;
@@ -283,7 +284,6 @@ import static org.hamcrest.Matchers.not;
 import static org.hamcrest.Matchers.notNullValue;
 import static org.hamcrest.Matchers.nullValue;
 import static org.hamcrest.Matchers.startsWith;
-import org.elasticsearch.cluster.routing.SplitShardCountSummary;
 
 /**
  * {@link ESIntegTestCase} is an abstract base class to run integration
@@ -1412,7 +1412,14 @@ public abstract class ESIntegTestCase extends ESTestCase {
             || engineConfig.getIndexSettings().seqNoIndexOptions().equals(SeqNoFieldMapper.SeqNoIndexOptions.DOC_VALUES_ONLY);
 
         final var docs = new ArrayList<DocIdSeqNoAndSource>();
-        try (var searcher = engine.acquireSearcher(reason, Engine.SearcherScope.INTERNAL, SplitShardCountSummary.IRRELEVANT, Function.identity())) {
+        try (
+            var searcher = engine.acquireSearcher(
+                reason,
+                Engine.SearcherScope.INTERNAL,
+                SplitShardCountSummary.IRRELEVANT,
+                Function.identity()
+            )
+        ) {
             final var reader = searcher.getDirectoryReader();
             for (LeafReaderContext leaf : reader.leaves()) {
                 final var leafReader = leaf.reader();

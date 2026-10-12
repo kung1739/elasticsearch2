@@ -11,6 +11,7 @@ package org.elasticsearch.index.mapper.vectors;
 
 import com.carrotsearch.randomizedtesting.annotations.ParametersFactory;
 
+import org.elasticsearch.cluster.routing.SplitShardCountSummary;
 import org.elasticsearch.common.bytes.BytesArray;
 import org.elasticsearch.common.bytes.BytesReference;
 import org.elasticsearch.common.settings.Settings;
@@ -37,10 +38,9 @@ import org.hamcrest.Matchers;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.function.Function;
 
 import static org.hamcrest.Matchers.equalTo;
-import org.elasticsearch.cluster.routing.SplitShardCountSummary;
-import java.util.function.Function;
 
 public class SyntheticVectorFieldsRecoveryTests extends EngineTestCase {
     private final boolean useSynthetic;
@@ -172,7 +172,12 @@ public class SyntheticVectorFieldsRecoveryTests extends EngineTestCase {
         }
         engine.flush();
 
-        var searcher = engine.acquireSearcher("test", Engine.SearcherScope.INTERNAL, SplitShardCountSummary.IRRELEVANT, Function.identity());
+        var searcher = engine.acquireSearcher(
+            "test",
+            Engine.SearcherScope.INTERNAL,
+            SplitShardCountSummary.IRRELEVANT,
+            Function.identity()
+        );
         try (
             var snapshot = newRandomSnapshot(
                 engine.config().getMapperService(),
