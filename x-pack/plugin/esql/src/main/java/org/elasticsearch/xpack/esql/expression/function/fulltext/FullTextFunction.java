@@ -23,6 +23,7 @@ import org.elasticsearch.xpack.esql.capabilities.PostOptimizationPlanVerificatio
 import org.elasticsearch.xpack.esql.capabilities.PostOptimizationVerificationAware;
 import org.elasticsearch.xpack.esql.capabilities.RewriteableAware;
 import org.elasticsearch.xpack.esql.capabilities.TranslationAware;
+import org.elasticsearch.xpack.esql.common.Failure;
 import org.elasticsearch.xpack.esql.common.Failures;
 import org.elasticsearch.xpack.esql.core.expression.Alias;
 import org.elasticsearch.xpack.esql.core.expression.Attribute;
@@ -30,7 +31,9 @@ import org.elasticsearch.xpack.esql.core.expression.AttributeMap;
 import org.elasticsearch.xpack.esql.core.expression.Expression;
 import org.elasticsearch.xpack.esql.core.expression.Expressions;
 import org.elasticsearch.xpack.esql.core.expression.FieldAttribute;
+import org.elasticsearch.xpack.esql.core.expression.FoldContext;
 import org.elasticsearch.xpack.esql.core.expression.Literal;
+import org.elasticsearch.xpack.esql.core.expression.MetadataAttribute;
 import org.elasticsearch.xpack.esql.core.expression.NamedExpression;
 import org.elasticsearch.xpack.esql.core.expression.Nullability;
 import org.elasticsearch.xpack.esql.core.expression.TypeResolutions;
@@ -43,9 +46,14 @@ import org.elasticsearch.xpack.esql.core.type.UnionTypeEsField;
 import org.elasticsearch.xpack.esql.core.util.Holder;
 import org.elasticsearch.xpack.esql.evaluator.mapper.EvaluatorMapper;
 import org.elasticsearch.xpack.esql.expression.function.scalar.convert.AbstractConvertFunction;
+import org.elasticsearch.xpack.esql.expression.predicate.Predicates;
 import org.elasticsearch.xpack.esql.expression.predicate.logical.BinaryLogic;
 import org.elasticsearch.xpack.esql.expression.predicate.logical.Not;
 import org.elasticsearch.xpack.esql.expression.predicate.operator.comparison.EsqlBinaryComparison;
+import org.elasticsearch.xpack.esql.optimizer.rules.logical.PushDownAndCombineFilters;
+import org.elasticsearch.xpack.esql.optimizer.rules.logical.PushDownAndCombineFilters.UnaryPushDown;
+import org.elasticsearch.xpack.esql.optimizer.rules.logical.PushDownAndCombineSample;
+import org.elasticsearch.xpack.esql.optimizer.rules.logical.SplitScorePredicatesFromRuntimeSearch;
 import org.elasticsearch.xpack.esql.optimizer.rules.physical.local.LucenePushdownPredicates;
 import org.elasticsearch.xpack.esql.plan.logical.Aggregate;
 import org.elasticsearch.xpack.esql.plan.logical.Dedup;
@@ -64,8 +72,10 @@ import org.elasticsearch.xpack.esql.plan.logical.OrderBy;
 import org.elasticsearch.xpack.esql.plan.logical.ParameterizedQuery;
 import org.elasticsearch.xpack.esql.plan.logical.Project;
 import org.elasticsearch.xpack.esql.plan.logical.Sample;
+import org.elasticsearch.xpack.esql.plan.logical.Subquery;
 import org.elasticsearch.xpack.esql.plan.logical.TopN;
 import org.elasticsearch.xpack.esql.plan.logical.TopNBy;
+import org.elasticsearch.xpack.esql.plan.logical.UnaryPlan;
 import org.elasticsearch.xpack.esql.plan.logical.UnionAll;
 import org.elasticsearch.xpack.esql.plan.logical.join.InlineJoin;
 import org.elasticsearch.xpack.esql.plan.logical.join.Join;
@@ -246,6 +256,7 @@ public abstract class FullTextFunction extends Function
     private static void checkFullTextQueryFunctions(LogicalPlan plan, Failures failures) {
         if (plan instanceof Filter f) {
             checkFullTextFunctionsInFilter(f, failures, false);
+            checkScoreWithRuntimeScorerOutsideConjunction(f, failures);
         } else if (plan instanceof Aggregate agg) {
             checkFullTextFunctionsInAggs(agg, failures);
         } else if (plan instanceof LookupJoin lookupJoin) {
@@ -281,6 +292,110 @@ public abstract class FullTextFunction extends Function
     private static void checkFullTextFunctionsInFilter(Filter filter, Failures failures, boolean checkFullTextFunctionsAboveSubqueries) {
         Expression condition = filter.condition();
         checkFullTextQueryFunctionForCondition(filter, failures, condition, false, checkFullTextFunctionsAboveSubqueries);
+    }
+
+    /**
+     * A {@code _score} predicate can only see the score of a runtime search in the same filter when the two are separate
+     * conjuncts, which {@code SplitScorePredicatesFromRuntimeSearch} splits apart; anywhere else, under {@code OR},
+     * {@code NOT} or a comparison, it would see the score from before the search. That rule normalizes the condition
+     * first, so this checks the conjuncts of the same normalized condition. Only run after analysis, while every
+     * {@code _score} is one written in the query: optimization substitutes {@code _score} for a copy of it, which holds
+     * the score from before the search and can be combined with it freely.
+     */
+    private static void checkScoreWithRuntimeScorerOutsideConjunction(Filter filter, Failures failures) {
+        if (containsRuntimeScorer(filter.condition()) == false) {
+            return;
+        }
+        Predicate<Expression> isScore = SplitScorePredicatesFromRuntimeSearch.scoreOf(filter.child());
+        if (filter.condition().anyMatch(isScore) == false) {
+            return;
+        }
+        Expression normalized = SplitScorePredicatesFromRuntimeSearch.normalize(filter.condition(), FoldContext.small());
+        for (Expression conjunct : Predicates.splitAnd(normalized)) {
+            if (conjunct.anyMatch(isScore) && holdsRuntimeScorerOncePushedDown(conjunct, filter.child(), false)) {
+                conjunct.forEachDown(FullTextFunction.class, ftf -> {
+                    if (ftf.isRuntimeSearch() && ftf.contributesToScore()) {
+                        failures.add(scoreWithRuntimeScorerFailure(conjunct, ftf));
+                    }
+                });
+            }
+        }
+    }
+
+    /**
+     * Whether {@code conjunct}, of a filter over {@code child}, still holds a runtime search that adds to {@code _score}
+     * once push-down has moved it as far down as it goes. A search on an alias or {@code RENAME} of an indexed field
+     * looks like a runtime search when analyzed, but push-down resolves the alias and turns it back into one that scores
+     * at the source. This moves the conjunct the way {@link PushDownAndCombineFilters} would, resolving aliases as it
+     * goes, and stops wherever that would stop, or at any command it doesn't follow it past. {@code belowSample} says
+     * whether the walk has already passed a {@code SAMPLE}, which bounds how far the conjunct goes.
+     */
+    private static boolean holdsRuntimeScorerOncePushedDown(Expression conjunct, LogicalPlan child, boolean belowSample) {
+        Expression pushed = conjunct;
+        LogicalPlan plan = child;
+        while (containsRuntimeScorer(pushed)) {
+            if (plan instanceof Sample sample) {
+                // A filter isn't pushed past a SAMPLE, but the SAMPLE is pushed down past the commands below it, so the
+                // filter can follow those, up to the SAMPLE's new place.
+                belowSample = true;
+                plan = sample.child();
+            } else if (belowSample && PushDownAndCombineSample.sinksPast(plan) == false) {
+                return true;
+            } else if (plan instanceof Filter filter) {
+                // A _score predicate doesn't combine into a filter which holds a runtime scorer, unless push-down turns
+                // the searches in that filter into ones that score at the source too.
+                Expression normalized = SplitScorePredicatesFromRuntimeSearch.normalize(filter.condition(), FoldContext.small());
+                for (Expression lower : Predicates.splitAnd(normalized)) {
+                    if (holdsRuntimeScorerOncePushedDown(lower, filter.child(), belowSample)) {
+                        return true;
+                    }
+                }
+                plan = filter.child();
+            } else if (plan instanceof Project project) {
+                AttributeMap.Builder<Expression> builder = AttributeMap.builder();
+                project.forEachExpression(Alias.class, alias -> builder.put(alias.toAttribute(), alias.child()));
+                AttributeMap<Expression> projectAliases = builder.build();
+                pushed = pushed.transformDown(Attribute.class, attribute -> projectAliases.resolve(attribute, attribute));
+                plan = project.child();
+            } else if (plan instanceof OrderBy orderBy) {
+                plan = orderBy.child();
+            } else if (plan instanceof Join join && PushDownAndCombineFilters.pushesIntoLeftSide(pushed, join)) {
+                plan = join.left();
+            } else if (plan instanceof Subquery subquery) {
+                plan = subquery.child();
+            } else if (plan instanceof MergePlan merge) {
+                // Push-down moves the conjunct into every branch of a FORK or UNION ALL, mapping the merge's output to
+                // each branch's by name.
+                for (LogicalPlan branch : merge.children()) {
+                    Expression inBranch = SplitScorePredicatesFromRuntimeSearch.intoBranch(pushed, merge, branch);
+                    if (holdsRuntimeScorerOncePushedDown(inBranch, branch, belowSample)) {
+                        return true;
+                    }
+                }
+                return false;
+            } else if (plan instanceof UnaryPlan unary && PushDownAndCombineFilters.pushDownPast(unary) instanceof UnaryPushDown pushDown) {
+                Expression resolved = pushDown.resolveRenames().apply(pushed);
+                if (resolved.anyMatch(pushDown.cannotPush())) {
+                    return true;
+                }
+                pushed = resolved;
+                plan = unary.child();
+            } else {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static Failure scoreWithRuntimeScorerFailure(Expression expression, FullTextFunction ftf) {
+        return fail(
+            expression,
+            "[{}] can't be used with runtime search [{}] inside OR, NOT or a comparison, as it would see the score from before "
+                + "the search; filter on [{}] with a top-level AND or a separate WHERE instead",
+            MetadataAttribute.SCORE,
+            ftf.functionName(),
+            MetadataAttribute.SCORE
+        );
     }
 
     private static void checkFullTextQueryFunctionForCondition(
@@ -703,6 +818,15 @@ public abstract class FullTextFunction extends Function
         // Runtime search is evaluated per row rather than through a Lucene query, and does not contribute to the
         // score (yet).
         return isRuntimeSearch() == false;
+    }
+
+    /**
+     * Whether {@code condition} contains a runtime search that adds to {@code _score}. Unlike a pushed-down search,
+     * which scores at the source, it scores only after the filter holding it has run, so a {@code _score} predicate
+     * must neither share that filter nor move below it.
+     */
+    public static boolean containsRuntimeScorer(Expression condition) {
+        return condition.anyMatch(e -> e instanceof FullTextFunction ftf && ftf.isRuntimeSearch() && ftf.contributesToScore());
     }
 
     private IndexedByShardId<ShardConfig> toShardConfigs(IndexedByShardId<? extends EsPhysicalOperationProviders.ShardContext> contexts) {
