@@ -19,6 +19,7 @@ import org.elasticsearch.compute.data.Page;
 import org.elasticsearch.core.Nullable;
 import org.elasticsearch.core.Releasables;
 import org.elasticsearch.core.Strings;
+import org.elasticsearch.index.mapper.UnmappedFields;
 import org.elasticsearch.tasks.TaskCancelledException;
 import org.elasticsearch.threadpool.ThreadPool;
 import org.elasticsearch.xcontent.XContentType;
@@ -32,7 +33,6 @@ import org.elasticsearch.xpack.esql.core.util.CollectionUtils;
 import org.elasticsearch.xpack.esql.plan.logical.UnmappedFieldsAttribute;
 import org.elasticsearch.xpack.esql.plan.logical.UnmappedFieldsPattern;
 import org.elasticsearch.xpack.esql.planner.PlannerSettings;
-import org.elasticsearch.xpack.esql.planner.UnmappedKeywordValues;
 import org.elasticsearch.xpack.esql.session.Result;
 
 import java.util.ArrayList;
@@ -58,9 +58,9 @@ import static org.elasticsearch.xpack.esql.approximation.ApproximationPlan.isApp
  * an object (matching the {@code null} an explicit reference to it reads), and {@code null} where a row lacks the leaf. Flattening lets a
  * synthetic-source index, which rebuilds a dotted source key as a nested object, expand to the same columns as a stored-source one.
  *
- * <p>The data node ships whole objects (it can only filter by top-level source key, pruning a subtree solely when a wildcard
- * {@code DROP} covers it), so this post-processor is where the {@link UnmappedFieldsPattern} is applied per flattened <em>leaf</em>
- * name.
+ * <p>A data node applies the {@link UnmappedFieldsPattern} to each leaf and ships the objects of {@code _source} reduced to
+ * the leaves it keeps. The pattern is applied here again because a data node on an earlier version ships whole objects that it
+ * filtered by top-level key only.
  *
  * <p>A discovered field is not a column when {@code KEEP} is resolved, so the plan could not position it then.
  * {@link UnmappedFieldsOrdering} hands the discovered fields back to the plan as if they had been mapped all
@@ -80,9 +80,8 @@ import static org.elasticsearch.xpack.esql.approximation.ApproximationPlan.isApp
  * to completion before the next poll. That is acceptable here because expansion cost scales with row count rather than any one row,
  * and the circuit breaker - not cancellation - is what bounds the memory a wide row can demand.
  * <p>
- * TODO every row's {@code _source} ends up parsed three times: the data node parses it to filter the column, then the
- *  coordinator parses the column once to collect field names and once more to expand them. A columnar shape — one block of
- *  names and one of values — would let us build the union while reading and expand without re-parsing.
+ * TODO the coordinator parses the column twice, once to collect field names and once more to expand them. A columnar shape — one
+ *  block of names and one of values — would let us build the union while reading and expand without re-parsing.
  */
 public final class ExpandUnmappedFieldsPostProcessor {
     /**
@@ -207,10 +206,10 @@ public final class ExpandUnmappedFieldsPostProcessor {
      * warning if that cut off any.
      * <p>
      * Every name returned earns an output column, which is why the data node drops the keys that carry no value - see
-     * {@code UnmappedFieldsBlockLoader} and {@link #assertNoAllNullExpandedColumn}.
+     * {@code UnmappedFields#blockLoader} and {@link #assertNoAllNullExpandedColumn}.
      * <p>
      * A discovered field name that collides with an existing column name is dropped, not an error: with flattening a discovered field
-     * mapped in one index can also appear in another's {@code _source}, and the per-shard UnmappedKeywordBlockLoader already filled
+     * mapped in one index can also appear in another's {@code _source}, and the per-shard loader of the named field already filled
      * that column, so the value is kept. Such names are dropped before the cap, so they do not take up its slots.
      * <p>
      * TODO walk the JSON with a parser instead of materialising a whole {@code Map} only to flatten it to field names. That would
@@ -486,7 +485,7 @@ public final class ExpandUnmappedFieldsPostProcessor {
     }
 
     /**
-     * Guard rail for what {@code UnmappedFieldsBlockLoader} promises this class: every key it writes into {@code _unmapped_fields}
+     * Guard rail for what {@code UnmappedFields#blockLoader} promises this class: every key it writes into {@code _unmapped_fields}
      * holds a value, and that value is what {@link #appendRow} writes back, so no expanded column can come out {@code null} in every
      * row.
      * <p>
@@ -607,10 +606,11 @@ public final class ExpandUnmappedFieldsPostProcessor {
 
     /**
      * Appends this row's value for each expanded leaf: {@code null} where the row lacks the leaf or the leaf is an object, a single
-     * keyword for a scalar, and a multivalue for an array (see {@link UnmappedKeywordValues}).
+     * keyword for a scalar, and a multivalue for an array (see {@link UnmappedFields#collectKeywords}).
      * <p>
-     * TODO each scalar is copied twice: {@link UnmappedKeywordValues} renders and UTF-8 encodes it into a fresh {@link BytesRef} and the
-     *  builder copies those bytes again. Values that are already {@code String}s could go straight into the builder's byte array.
+     * TODO each scalar is copied twice: {@link UnmappedFields#collectKeywords} renders and UTF-8 encodes it into a fresh
+     *  {@link BytesRef} and the builder copies those bytes again. Values that are already {@code String}s could go straight into
+     *  the builder's byte array.
      */
     private static void appendRow(
         Map<String, Object> leaves,
@@ -620,7 +620,7 @@ public final class ExpandUnmappedFieldsPostProcessor {
     ) {
         for (int i = 0; i < builders.length; i++) {
             valueScratch.clear();
-            UnmappedKeywordValues.collect(leaves.get(leafNames.get(i)), valueScratch);
+            UnmappedFields.collectKeywords(leaves.get(leafNames.get(i)), valueScratch);
             if (valueScratch.isEmpty()) {
                 builders[i].appendNull();
             } else if (valueScratch.size() == 1) {
@@ -636,7 +636,7 @@ public final class ExpandUnmappedFieldsPostProcessor {
     }
 
     /**
-     * Guard rail for the other half of what {@code UnmappedFieldsBlockLoader} promises: whatever it wrote under a key is pruned, so it
+     * Guard rail for the other half of what {@code UnmappedFields#blockLoader} promises: whatever it wrote under a key is pruned, so it
      * holds no {@code null} inside an array or object and no empty array or object at any depth. {@link #appendRow} renders the whole
      * value, so a {@code null} that survived would reach the user as a literal {@code "null"} inside a stringified array - where a
      * mapped field would have produced a multi-value, and multi-values never contain nulls.

@@ -15,18 +15,18 @@ import org.elasticsearch.common.unit.ByteSizeValue;
 import org.elasticsearch.common.xcontent.XContentHelper;
 import org.elasticsearch.index.mapper.BlockLoader;
 import org.elasticsearch.index.mapper.BlockSourceReader;
+import org.elasticsearch.index.mapper.MapperService;
+import org.elasticsearch.index.mapper.MapperServiceTestCase;
 import org.elasticsearch.index.mapper.TestBlock;
+import org.elasticsearch.index.mapper.UnmappedFields;
 import org.elasticsearch.indices.CrankyCircuitBreakerService;
 import org.elasticsearch.search.lookup.Source;
-import org.elasticsearch.test.ESTestCase;
 import org.elasticsearch.xcontent.XContentType;
 import org.elasticsearch.xpack.esql.plan.logical.UnmappedFieldsPattern;
 
 import java.io.IOException;
 import java.util.List;
 import java.util.Map;
-import java.util.Set;
-import java.util.function.Predicate;
 
 import static org.elasticsearch.test.MapMatcher.assertMap;
 import static org.elasticsearch.test.MapMatcher.matchesMap;
@@ -34,12 +34,13 @@ import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.nullValue;
 
 /**
- * Tests that {@link UnmappedFieldsBlockLoader} reads {@code _source} and keeps only the top-level keys
- * selected by its {@link UnmappedFieldsPattern}, dropping everything else: the mapped fields (which the
- * analyzer adds to the pattern's excludes), any key that does not match the includes, and any key whose
- * value carries no information for the coordinator to turn into a column.
+ * Tests which unmapped fields {@link UnmappedFields#blockLoader(UnmappedFields.Filter, double)} loads for an
+ * {@link UnmappedFieldsPattern}: the leaves of {@code _source} that the pattern keeps and that hold a value, inside the
+ * objects and arrays that lead to them. Everything else is dropped on the shard: the mapped fields (which the analyzer
+ * adds to the pattern's excludes), any leaf that does not match the includes, and any that carries nothing for the
+ * coordinator to turn into a column.
  */
-public class UnmappedFieldsBlockLoaderTests extends ESTestCase {
+public class UnmappedFieldsPatternLoadingTests extends MapperServiceTestCase {
 
     /** Any value above one exercises the scaling; production reads it from {@code PlannerSettings.SOURCE_RESERVATION_FACTOR}. */
     private static final double RESERVATION_FACTOR = 4;
@@ -86,29 +87,29 @@ public class UnmappedFieldsBlockLoaderTests extends ESTestCase {
         assertMap(filtered, matchesMap().entry("public_note", "hello"));
     }
 
-    public void testNestedSourceValuesArePreserved() throws IOException {
+    public void testObjectsAreKeptAsObjects() throws IOException {
         Map<String, Object> filtered = load(UnmappedFieldsPattern.excludes(List.of("first_name")), """
             { "address": { "city": "Berlin", "zip": "10115" }, "tags": [ "a", "b" ], "first_name": "John" }""");
         assertMap(filtered, matchesMap().entry("address", Map.of("city", "Berlin", "zip", "10115")).entry("tags", List.of("a", "b")));
     }
 
-    public void testScalarArrayShipsUnderRestrictiveIncludeGroup() throws IOException {
+    /** An array of scalars is a leaf named after the array, so it is held to the pattern like a scalar is. */
+    public void testScalarArrayIsGatedLikeAScalar() throws IOException {
         Map<String, Object> filtered = load(UnmappedFieldsPattern.includes(List.of("tags*")), """
             { "tags": [ "a", "b" ], "other": "x" }""");
         assertMap(filtered, matchesMap().entry("tags", List.of("a", "b")));
 
-        Map<String, Object> dotted = load(UnmappedFieldsPattern.includes(List.of("tags.*")), """
-            { "tags": [ "a", "b" ], "other": "x" }""");
-        assertMap(dotted, matchesMap().entry("tags", List.of("a", "b")));
+        assertThat(load(UnmappedFieldsPattern.includes(List.of("tags.*")), """
+            { "tags": [ "a", "b" ], "other": "x" }"""), nullValue());
     }
 
-    public void testObjectShipsWhenOnlyItsDescendantsCanMatch() throws IOException {
+    public void testObjectIsEnteredWhenOnlyItsDescendantsCanMatch() throws IOException {
         Map<String, Object> filtered = load(UnmappedFieldsPattern.includes(List.of("address.*")), """
             { "address": { "city": "Berlin" }, "other": "x" }""");
         assertMap(filtered, matchesMap().entry("address", Map.of("city", "Berlin")));
     }
 
-    /** Same pattern and key as above, but a scalar is gated on the strict {@code matches} rather than shipping leniently. */
+    /** Same pattern and key as above, but a scalar at that key is a leaf of its own, which the pattern does not keep. */
     public void testScalarUnderTheSamePatternIsGatedStrictly() throws IOException {
         assertThat(load(UnmappedFieldsPattern.includes(List.of("address.*")), """
             { "address": "scalar" }"""), nullValue());
@@ -163,7 +164,7 @@ public class UnmappedFieldsBlockLoaderTests extends ESTestCase {
     public void testSourceObjectWithAValueKeepsOnlyThatValue() throws IOException {
         Map<String, Object> filtered = load(UnmappedFieldsPattern.ALL, """
             { "extra": { "baz": "world", "empty": [], "null_leaf": null } }""");
-        assertMap(filtered, matchesMap().entry("extra", matchesMap().entry("baz", "world")));
+        assertMap(filtered, matchesMap().entry("extra", Map.of("baz", "world")));
     }
 
     public void testOnlyValuelessSourceValuesEmitsNull() throws IOException {
@@ -187,8 +188,7 @@ public class UnmappedFieldsBlockLoaderTests extends ESTestCase {
         assertMap(filtered, matchesMap().entry("tags", List.of(List.of("b"), Map.of("keep", "me"))));
     }
 
-    /** Nothing to prune means nothing to rebuild: the loader hands the value straight through, untouched. */
-    public void testValuesWithoutNullsPassThroughUnchanged() throws IOException {
+    public void testEveryLeafWithAValueIsKept() throws IOException {
         Map<String, Object> filtered = load(UnmappedFieldsPattern.ALL, """
             { "tags": [ "a", "b" ], "address": { "city": "Berlin", "zips": [ "10115" ] } }""");
         assertMap(
@@ -198,10 +198,10 @@ public class UnmappedFieldsBlockLoaderTests extends ESTestCase {
     }
 
     public void testReaderToStringIsDistinctFromLoader() throws IOException {
-        UnmappedFieldsBlockLoader loader = loader(UnmappedFieldsPattern.ALL);
-        assertThat(loader.toString(), equalTo("UnmappedFieldsBlockLoader"));
+        BlockLoader loader = loader(UnmappedFieldsPattern.ALL);
+        assertThat(loader.toString(), equalTo("UnmappedFields.All"));
         try (BlockLoader.RowStrideReader reader = loader.rowStrideReader(newLimitedBreaker(ByteSizeValue.ofMb(1)), null)) {
-            assertThat(reader.toString(), equalTo("UnmappedFieldsBlockLoader.UnmappedFields"));
+            assertThat(reader.toString(), equalTo("UnmappedFields.All.Reader"));
         }
     }
 
@@ -209,7 +209,7 @@ public class UnmappedFieldsBlockLoaderTests extends ESTestCase {
         Source source = Source.fromMap(Map.of("payload", "x".repeat(4096)), XContentType.JSON);
         long reservation = (long) (source.internalSourceRef().length() * RESERVATION_FACTOR);
         CircuitBreaker breaker = newLimitedBreaker(ByteSizeValue.ofBytes(BlockSourceReader.ESTIMATED_SIZE + reservation));
-        UnmappedFieldsBlockLoader loader = loader(UnmappedFieldsPattern.ALL);
+        BlockLoader loader = loader(UnmappedFieldsPattern.ALL);
         try (BlockLoader.RowStrideReader reader = loader.rowStrideReader(breaker, null)) {
             long readerReservation = breaker.getUsed();
             assertThat(readerReservation, equalTo(BlockSourceReader.ESTIMATED_SIZE));
@@ -227,7 +227,7 @@ public class UnmappedFieldsBlockLoaderTests extends ESTestCase {
         // Room for the raw source but not for the far larger map it parses into, so only a scaled reservation trips this.
         long limit = BlockSourceReader.ESTIMATED_SIZE + source.internalSourceRef().length();
         CircuitBreaker breaker = newLimitedBreaker(ByteSizeValue.ofBytes(limit));
-        UnmappedFieldsBlockLoader loader = loader(UnmappedFieldsPattern.ALL);
+        BlockLoader loader = loader(UnmappedFieldsPattern.ALL);
         try (BlockLoader.RowStrideReader reader = loader.rowStrideReader(breaker, null)) {
             BlockLoader.Builder builder = loader.builder(TestBlock.factory(), 1);
             expectThrows(CircuitBreakingException.class, () -> reader.read(0, storedFields(source), builder));
@@ -236,7 +236,7 @@ public class UnmappedFieldsBlockLoaderTests extends ESTestCase {
     }
 
     public void testReaderUnderCrankyBreakerDoesNotLeak() throws IOException {
-        UnmappedFieldsBlockLoader loader = loader(UnmappedFieldsPattern.ALL);
+        BlockLoader loader = loader(UnmappedFieldsPattern.ALL);
         Source source = Source.fromBytes(new BytesArray("""
             { "a": "b", "c": "d" }"""), XContentType.JSON);
         var cranky = new CrankyCircuitBreakerService.CrankyCircuitBreaker();
@@ -252,38 +252,60 @@ public class UnmappedFieldsBlockLoaderTests extends ESTestCase {
     }
 
     /**
-     * A leaf the shard's mapping declares under a nested parent is stripped like a value-less part: mapped nested
-     * subfields stay null everywhere. Siblings that are not declared keep shipping, and a fully stripped object drops.
+     * A nested object reads from the root document like any array of objects: a field its mapping does not declare holds
+     * the values of all the nested objects. The fields it maps are left out, like any mapped field.
      */
-    public void testMappedNestedSubfieldLeavesArePruned() throws IOException {
-        Map<String, Object> filtered = load(UnmappedFieldsPattern.ALL, Set.of("item.extra")::contains, """
-            { "item": [ { "value": 1, "extra": "x" } ], "other": "y" }""");
-        assertMap(filtered, matchesMap().entry("item", List.of(Map.of("value", 1))).entry("other", "y"));
+    public void testBelowANestedObjectUndeclaredFieldsAreLoaded() throws IOException {
+        Map<String, Object> filtered = load(UnmappedFieldsPattern.ALL, """
+            { "item": [ { "value": 1, "extra": "x" }, { "value": 2, "extra": "y" } ], "item.value": 3, "other": "z" }""");
+        assertMap(
+            filtered,
+            matchesMap().entry("item", List.of(Map.of("value", 1), Map.of("value", 2))).entry("item.value", 3).entry("other", "z")
+        );
 
-        assertThat(load(UnmappedFieldsPattern.ALL, Set.of("item.value", "item.extra")::contains, """
-            { "item": [ { "value": 1, "extra": "x" } ] }"""), nullValue());
+        assertThat(load(UnmappedFieldsPattern.ALL, """
+            { "item": [ { "extra": "x" } ], "item.extra": "y" }"""), nullValue());
     }
 
-    private static UnmappedFieldsBlockLoader loader(UnmappedFieldsPattern pattern) {
-        return loader(pattern, path -> false);
+    /**
+     * A mapped field keeps its whole value under its own name, so the keys of an object it holds are not fields.
+     */
+    public void testNothingBelowAMappedFieldIsLoaded() throws IOException {
+        Map<String, Object> filtered = load(UnmappedFieldsPattern.ALL, """
+            { "span": { "gte": 1, "lt": 5 }, "labels": { "env": "prod" }, "other": { "gte": 1 } }""");
+        assertMap(filtered, matchesMap().entry("other", Map.of("gte", 1)));
+
+        // A key spelled with dots is the same path.
+        filtered = load(UnmappedFieldsPattern.ALL, """
+            { "labels.env": "prod", "labels.a.b": 1, "span.gte": 2, "other.gte": 1 }""");
+        assertMap(filtered, matchesMap().entry("other.gte", 1));
     }
 
-    private static UnmappedFieldsBlockLoader loader(UnmappedFieldsPattern pattern, Predicate<String> mappedNestedSubfield) {
-        return new UnmappedFieldsBlockLoader(pattern, RESERVATION_FACTOR, mappedNestedSubfield);
+    /**
+     * The loader of a shard whose mapping keeps the fields it does not declare. It maps a nested object {@code item} with a
+     * field {@code extra}, an {@code integer_range} field {@code span} and a {@code flattened} field {@code labels}.
+     */
+    private BlockLoader loader(UnmappedFieldsPattern pattern) throws IOException {
+        MapperService mapperService = createMapperService(topMapping(b -> {
+            b.field("dynamic", false);
+            b.startObject("properties");
+            b.startObject("item").field("type", "nested").startObject("properties");
+            b.startObject("extra").field("type", "keyword").endObject();
+            b.endObject().endObject();
+            b.startObject("span").field("type", "integer_range").endObject();
+            b.startObject("labels").field("type", "flattened").endObject();
+            b.endObject();
+        }));
+        return createSearchExecutionContext(mapperService).unmappedFields()
+            .blockLoader(UnmappedFields.Filter.of(pattern::matches, pattern::objectSubfieldsCouldMatch), RESERVATION_FACTOR);
     }
 
     /**
      * Runs the block loader over a single document whose {@code _source} is {@code sourceJson} and returns the emitted
-     * JSON parsed back into a map, or {@code null} if the loader emitted a null because no key matched the pattern.
-     * {@code convertToMap} returns a (content-type, map) tuple, so {@code v2()} is the map.
+     * JSON parsed back into a map, or {@code null} if the loader emitted a null because no leaf matched the pattern.
      */
-    private static Map<String, Object> load(UnmappedFieldsPattern pattern, String sourceJson) throws IOException {
-        return load(pattern, path -> false, sourceJson);
-    }
-
-    private static Map<String, Object> load(UnmappedFieldsPattern pattern, Predicate<String> mappedNestedSubfield, String sourceJson)
-        throws IOException {
-        UnmappedFieldsBlockLoader loader = loader(pattern, mappedNestedSubfield);
+    private Map<String, Object> load(UnmappedFieldsPattern pattern, String sourceJson) throws IOException {
+        BlockLoader loader = loader(pattern);
         try (BlockLoader.RowStrideReader reader = loader.rowStrideReader(newLimitedBreaker(ByteSizeValue.ofMb(1)), null)) {
             BlockLoader.Builder builder = loader.builder(TestBlock.factory(), 1);
             reader.read(0, storedFields(Source.fromBytes(new BytesArray(sourceJson), XContentType.JSON)), builder);

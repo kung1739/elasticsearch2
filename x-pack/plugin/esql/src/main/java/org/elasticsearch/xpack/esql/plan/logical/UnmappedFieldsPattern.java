@@ -204,13 +204,10 @@ public final class UnmappedFieldsPattern implements NamedWriteable {
     }
 
     /**
-     * Whether a top-level {@code _source} object or array key should ship from the data node so the coordinator can flatten it into dotted
-     * leaf columns. Deliberately a superset of the per-leaf {@link #matches}: an array of scalars flattens to a leaf named exactly
-     * {@code name}, so anything {@code matches} would keep has to ship from here first.
+     * Whether some leaf below the object {@code name} could {@link #matches match}, so that a walk of {@code _source} has a
+     * reason to enter it. Never {@code false} for an object holding a leaf that matches.
      */
     public boolean objectSubfieldsCouldMatch(String name) {
-        // TODO: apply the UnmappedFieldsPattern early so that whatever is being shipped to the coordinator is bare minimum
-        // (as opposed to shipping the whole _source of that specific field + its subfields)
         if (isNone() || anyMatches(subtreeCoveringExcludes, name)) {
             return false;
         }
