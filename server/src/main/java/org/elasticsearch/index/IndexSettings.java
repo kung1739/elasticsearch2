@@ -2669,6 +2669,16 @@ public final class IndexSettings {
         return disableSequenceNumbers;
     }
 
+    /**
+     * Whether in-place doc-values updates on this index advance the document's optimistic-concurrency identity through the
+     * {@code _dv_update_seq_no}/{@code _dv_update_primary_term} companion columns (see {@link SeqNoFieldMapper}). True for strict
+     * columnar indices that keep sequence numbers. Updatable fields are rejected when sequence numbers are disabled, so any index that
+     * has them always has this enabled.
+     */
+    public boolean seqNoAwareDocValuesUpdates() {
+        return disableSequenceNumbers == false && getMode().isStrictColumnar();
+    }
+
     private void setDynamicStringsAutoText(boolean enabled) {
         this.dynamicStringsAutoText = enabled;
     }
