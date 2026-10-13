@@ -1,0 +1,1091 @@
+/*
+ * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one
+ * or more contributor license agreements. Licensed under the Elastic License
+ * 2.0; you may not use this file except in compliance with the Elastic License
+ * 2.0.
+ */
+
+package org.elasticsearch.xpack.esql.action;
+
+import org.elasticsearch.ResourceNotFoundException;
+import org.elasticsearch.cluster.metadata.DatasetFieldMapping;
+import org.elasticsearch.cluster.metadata.View;
+import org.elasticsearch.common.settings.Settings;
+import org.elasticsearch.index.query.QueryBuilders;
+import org.elasticsearch.plugins.Plugin;
+import org.elasticsearch.test.ESIntegTestCase;
+import org.elasticsearch.xpack.core.esql.action.ColumnInfo;
+import org.elasticsearch.xpack.esql.VerificationException;
+import org.elasticsearch.xpack.esql.datasource.csv.CsvDataSourcePlugin;
+import org.elasticsearch.xpack.esql.plugin.QueryPragmas;
+import org.elasticsearch.xpack.esql.view.DeleteViewAction;
+import org.elasticsearch.xpack.esql.view.PutViewAction;
+import org.junit.After;
+import org.junit.Before;
+
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.Arrays;
+import java.util.Collection;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+
+import static org.elasticsearch.test.hamcrest.ElasticsearchAssertions.assertAcked;
+import static org.elasticsearch.xpack.esql.EsqlTestUtils.getValuesList;
+import static org.elasticsearch.xpack.esql.action.EsqlQueryRequest.syncEsqlQueryRequest;
+import static org.hamcrest.Matchers.containsString;
+import static org.hamcrest.Matchers.equalTo;
+import static org.hamcrest.Matchers.hasItem;
+import static org.hamcrest.Matchers.hasSize;
+import static org.hamcrest.Matchers.notNullValue;
+import static org.hamcrest.Matchers.nullValue;
+
+/**
+ * End-to-end coverage for ES|QL views whose body reads a registered dataset.
+ */
+@ESIntegTestCase.ClusterScope(scope = ESIntegTestCase.Scope.SUITE, numDataNodes = 1, numClientNodes = 0, supportsDedicatedMasters = false)
+public class FromDatasetViewIT extends AbstractExternalDataSourceIT {
+
+    private Path csvFixture;
+    private Path csvFixtureAlt;
+    private Path csvFixtureSalaryInt;
+    private Path csvFixtureSalaryLong;
+    private Path csvFixtureSalaryKeyword;
+    private final Set<String> createdViews = new LinkedHashSet<>();
+
+    @Override
+    protected Collection<Class<? extends Plugin>> formatPlugins() {
+        return List.of(CsvDataSourcePlugin.class);
+    }
+
+    @Override
+    protected QueryPragmas getPragmas() {
+        return QueryPragmas.EMPTY;
+    }
+
+    @Before
+    public void writeFixture() throws IOException {
+        csvFixture = createTempFile("dataset-view-fixture-", ".csv");
+        Files.writeString(
+            csvFixture,
+            String.join(
+                "\n",
+                "emp_no:integer,first_name:keyword,last_name:keyword,department:keyword,salary:integer",
+                "1,Alice,Anderson,Engineering,50000",
+                "2,Bob,Brown,Engineering,60000",
+                "3,Carol,Cox,Sales,55000"
+            ) + "\n"
+        );
+        csvFixtureAlt = createTempFile("dataset-view-fixture-alt-", ".csv");
+        Files.writeString(
+            csvFixtureAlt,
+            String.join(
+                "\n",
+                "emp_no:integer,first_name:keyword,last_name:keyword,department:keyword,salary:integer",
+                "10,Diana,Davis,Engineering,75000",
+                "11,Eve,Evans,Sales,65000"
+            ) + "\n"
+        );
+        csvFixtureSalaryInt = createTempFile("dataset-view-salary-int-", ".csv");
+        Files.writeString(
+            csvFixtureSalaryInt,
+            String.join("\n", "emp_no:integer,name:keyword,salary:integer", "1,Alice,50000", "2,Bob,60000") + "\n"
+        );
+        csvFixtureSalaryLong = createTempFile("dataset-view-salary-long-", ".csv");
+        Files.writeString(
+            csvFixtureSalaryLong,
+            String.join("\n", "emp_no:integer,name:keyword,salary:long", "10,Diana,75000", "11,Eve,65000") + "\n"
+        );
+        csvFixtureSalaryKeyword = createTempFile("dataset-view-salary-keyword-", ".csv");
+        Files.writeString(csvFixtureSalaryKeyword, String.join("\n", "emp_no:integer,name:keyword,salary:keyword", "20,Frank,high") + "\n");
+    }
+
+    @After
+    public void cleanupViews() {
+        for (String view : createdViews) {
+            try {
+                client().execute(DeleteViewAction.INSTANCE, new DeleteViewAction.Request(TIMEOUT, TIMEOUT, new String[] { view }))
+                    .actionGet(TIMEOUT);
+            } catch (ResourceNotFoundException ignored) {
+                // not created, or already deleted
+            } catch (Exception e) {
+                logger.warn("view cleanup [{}] failed", view, e);
+            }
+        }
+        createdViews.clear();
+    }
+
+    // dataset inside view
+
+    public void testDatasetView() {
+        registerEmployees();
+        createView("employees_view", "FROM employees");
+        try (var response = run(syncEsqlQueryRequest("FROM employees_view | SORT emp_no | KEEP emp_no, first_name | LIMIT 10"), TIMEOUT)) {
+            assertThat(getValuesList(response), equalTo(List.of(List.of(1, "Alice"), List.of(2, "Bob"), List.of(3, "Carol"))));
+        }
+    }
+
+    public void testWhereAfterDatasetView() {
+        registerEmployees();
+        createView("emp_ds_view", "FROM employees");
+        try (
+            var response = run(syncEsqlQueryRequest("FROM emp_ds_view | WHERE emp_no > 1 | SORT emp_no | KEEP emp_no, first_name"), TIMEOUT)
+        ) {
+            assertThat(getValuesList(response), equalTo(List.of(List.of(2, "Bob"), List.of(3, "Carol"))));
+        }
+    }
+
+    public void testEvalKeepRenameDropAfterDatasetView() {
+        registerEmployees();
+        createView("emp_ds_view", "FROM employees");
+        try (var response = run(syncEsqlQueryRequest("""
+            FROM emp_ds_view
+            | EVAL doubled = emp_no * 2
+            | RENAME first_name AS name
+            | DROP last_name
+            | KEEP emp_no, name, doubled
+            | SORT emp_no
+            """), TIMEOUT)) {
+            assertColumnNames(response.columns(), List.of("emp_no", "name", "doubled"));
+            assertThat(getValuesList(response), equalTo(List.of(List.of(1, "Alice", 2), List.of(2, "Bob", 4), List.of(3, "Carol", 6))));
+        }
+    }
+
+    public void testStatsAfterDatasetView() {
+        registerEmployees();
+        createView("emp_ds_view", "FROM employees");
+        try (var response = run(syncEsqlQueryRequest("""
+            FROM emp_ds_view
+            | STATS c = COUNT(*) BY department
+            | KEEP department, c
+            | SORT department
+            """), TIMEOUT)) {
+            assertThat(getValuesList(response), equalTo(List.of(List.of("Engineering", 2L), List.of("Sales", 1L))));
+        }
+    }
+
+    public void testInlineStatsAfterDatasetView() {
+        registerEmployees();
+        createView("emp_ds_view", "FROM employees");
+        try (var response = run(syncEsqlQueryRequest("""
+            FROM emp_ds_view
+            | INLINE STATS c = COUNT(*) BY department
+            | KEEP emp_no, department, c
+            | SORT emp_no
+            """), TIMEOUT)) {
+            assertThat(
+                getValuesList(response),
+                equalTo(List.of(List.of(1, "Engineering", 2L), List.of(2, "Engineering", 2L), List.of(3, "Sales", 1L)))
+            );
+        }
+    }
+
+    public void testLookupJoinAfterDatasetView() {
+        registerEmployees();
+        createDepartmentsLookup();
+        createView("emp_ds_view", "FROM employees");
+        try (var response = run(syncEsqlQueryRequest("""
+            FROM emp_ds_view
+            | LOOKUP JOIN departments_lookup ON department
+            | KEEP emp_no, department, location
+            | SORT emp_no
+            """), TIMEOUT)) {
+            assertThat(
+                getValuesList(response),
+                equalTo(
+                    List.of(
+                        List.of(1, "Engineering", "Mountain View"),
+                        List.of(2, "Engineering", "Mountain View"),
+                        List.of(3, "Sales", "New York")
+                    )
+                )
+            );
+        }
+    }
+
+    public void testMatchAndMatchPhraseAfterDatasetView() {
+        registerEmployees();
+        createView("emp_ds_view", "FROM employees");
+        try (var response = run(syncEsqlQueryRequest("""
+            FROM emp_ds_view
+            | WHERE MATCH(first_name, "Alice")
+            | KEEP first_name, last_name
+            """), TIMEOUT)) {
+            assertColumnNames(response.columns(), List.of("first_name", "last_name"));
+            assertValues(response.values(), List.of(List.of("Alice", "Anderson")));
+        }
+        try (var response = run(syncEsqlQueryRequest("""
+            FROM emp_ds_view
+            | WHERE MATCH_PHRASE(first_name, "Alice")
+            | KEEP first_name, last_name
+            """), TIMEOUT)) {
+            assertColumnNames(response.columns(), List.of("first_name", "last_name"));
+            assertValues(response.values(), List.of(List.of("Alice", "Anderson")));
+        }
+    }
+
+    public void testInSubqueryAfterDatasetView() {
+        registerEmployees();
+        createView("emp_ds_view", "FROM employees");
+        try (var response = run(syncEsqlQueryRequest("""
+            FROM emp_ds_view
+            | WHERE emp_no IN (FROM employees | WHERE department == "Engineering" | KEEP emp_no)
+            | SORT emp_no
+            | KEEP emp_no
+            """), TIMEOUT)) {
+            assertThat(getValuesList(response), equalTo(List.of(List.of(1), List.of(2))));
+        }
+
+        try (var response = run(syncEsqlQueryRequest("""
+            FROM emp_ds_view
+            | WHERE emp_no NOT IN (FROM employees | WHERE department == "Engineering" | KEEP emp_no)
+            | SORT emp_no
+            | KEEP emp_no
+            """), TIMEOUT)) {
+            assertThat(getValuesList(response), equalTo(List.of(List.of(3))));
+        }
+    }
+
+    public void testDatasetViewInsideInSubquery() {
+        registerEmployees();
+        createView("emp_ds_view", "FROM employees");
+        try (var response = run(syncEsqlQueryRequest("""
+            FROM employees
+            | WHERE department IN (FROM emp_ds_view | KEEP department)
+            | SORT emp_no
+            | KEEP emp_no
+            """), TIMEOUT)) {
+            assertThat(getValuesList(response), equalTo(List.of(List.of(1), List.of(2), List.of(3))));
+        }
+    }
+
+    // dataset with processing commands inside view
+
+    public void testWhereInsideDatasetView() {
+        registerEmployees();
+        createView("employees_filtered_view", "FROM employees | WHERE emp_no > 1");
+        try (var response = run(syncEsqlQueryRequest("FROM employees_filtered_view | SORT emp_no | KEEP emp_no, first_name"), TIMEOUT)) {
+            assertThat(getValuesList(response), equalTo(List.of(List.of(2, "Bob"), List.of(3, "Carol"))));
+        }
+    }
+
+    public void testStatsInsideDatasetView() {
+        registerEmployees();
+        createView("emp_stats_view", "FROM employees | STATS c = COUNT(*) BY department");
+        try (var response = run(syncEsqlQueryRequest("FROM emp_stats_view | KEEP department, c | SORT department"), TIMEOUT)) {
+            assertThat(getValuesList(response), equalTo(List.of(List.of("Engineering", 2L), List.of("Sales", 1L))));
+        }
+    }
+
+    public void testInlineStatsInsideDatasetView() {
+        registerEmployees();
+        createView("emp_inline_stats_view", """
+            FROM employees
+            | INLINE STATS max_salary = MAX(salary)
+            | WHERE salary == max_salary
+            | KEEP emp_no, salary, max_salary
+            """);
+        try (var response = run(syncEsqlQueryRequest("FROM emp_inline_stats_view"), TIMEOUT)) {
+            assertThat(getValuesList(response), equalTo(List.of(List.of(2, 60000, 60000))));
+        }
+    }
+
+    public void testLookupJoinInsideDatasetView() {
+        registerEmployees();
+        createDepartmentsLookup();
+        createView("emp_lookup_view", "FROM employees | LOOKUP JOIN departments_lookup ON department | KEEP emp_no, department, location");
+        try (var response = run(syncEsqlQueryRequest("FROM emp_lookup_view | SORT emp_no"), TIMEOUT)) {
+            assertThat(
+                getValuesList(response),
+                equalTo(
+                    List.of(
+                        List.of(1, "Engineering", "Mountain View"),
+                        List.of(2, "Engineering", "Mountain View"),
+                        List.of(3, "Sales", "New York")
+                    )
+                )
+            );
+        }
+    }
+
+    public void testDissectInsideDatasetView() {
+        registerEmployees();
+        createView("emp_dissect_view", "FROM employees | DISSECT first_name \"%{first_letter}lice\" | KEEP emp_no, first_letter");
+        try (var response = run(syncEsqlQueryRequest("FROM emp_dissect_view | SORT emp_no"), TIMEOUT)) {
+            List<List<Object>> rows = getValuesList(response);
+            assertThat(rows, hasSize(3));
+            int letterIdx = response.columns().stream().map(ColumnInfo::name).toList().indexOf("first_letter");
+            long matches = rows.stream().filter(r -> r.get(letterIdx) != null && r.get(letterIdx).toString().equals("A")).count();
+            assertThat(matches, equalTo(1L));
+        }
+    }
+
+    public void testSortLimitInsideDatasetView() {
+        registerEmployees();
+        createView("emp_sort_limit_view", "FROM employees | SORT salary DESC | LIMIT 2 | KEEP emp_no, first_name");
+        try (var response = run(syncEsqlQueryRequest("FROM emp_sort_limit_view"), TIMEOUT)) {
+            assertThat(getValuesList(response), equalTo(List.of(List.of(2, "Bob"), List.of(3, "Carol"))));
+        }
+    }
+
+    public void testInSubqueryInsideDatasetView() {
+        registerEmployees();
+        createView("emp_in_view", """
+            FROM employees
+            | WHERE emp_no IN (FROM employees | WHERE department == "Sales" | KEEP emp_no)
+            """);
+        try (var response = run(syncEsqlQueryRequest("FROM emp_in_view | KEEP emp_no, first_name"), TIMEOUT)) {
+            assertThat(getValuesList(response), equalTo(List.of(List.of(3, "Carol"))));
+        }
+    }
+
+    public void testEvalKeepRenameDropInsideDatasetView() {
+        registerEmployees();
+        createView("emp_eval_view", """
+            FROM employees
+            | EVAL doubled = emp_no * 2
+            | RENAME first_name AS name
+            | DROP last_name
+            | KEEP emp_no, name, doubled
+            """);
+        try (var response = run(syncEsqlQueryRequest("FROM emp_eval_view | SORT emp_no"), TIMEOUT)) {
+            assertColumnNames(response.columns(), List.of("emp_no", "name", "doubled"));
+            assertThat(getValuesList(response), equalTo(List.of(List.of(1, "Alice", 2), List.of(2, "Bob", 4), List.of(3, "Carol", 6))));
+        }
+    }
+
+    public void testMatchInsideDatasetView() {
+        registerEmployees();
+        createView("emp_match_view", "FROM employees | WHERE MATCH(first_name, \"Alice\") | KEEP first_name, last_name");
+        try (var response = run(syncEsqlQueryRequest("FROM emp_match_view"), TIMEOUT)) {
+            assertColumnNames(response.columns(), List.of("first_name", "last_name"));
+            assertValues(response.values(), List.of(List.of("Alice", "Anderson")));
+        }
+    }
+
+    public void testStatsAfterStatsDatasetView() {
+        registerEmployees();
+        createView("emp_stats_view", "FROM employees | STATS c = COUNT(*) BY department");
+        try (var response = run(syncEsqlQueryRequest("FROM emp_stats_view | STATS total = SUM(c)"), TIMEOUT)) {
+            assertThat(getValuesList(response), equalTo(List.of(List.of(3L))));
+        }
+    }
+
+    // UnionAll subquery inside view over dataset, nested branches
+
+    public void testUnionAllSubqueryInsideDatasetView() {
+        registerEmployees();
+        registerEmployeesAlt();
+        createView("emp_union_view", "FROM (FROM employees), (FROM employees_alt)");
+        try (var response = run(syncEsqlQueryRequest("FROM emp_union_view | STATS c = COUNT(*)"), TIMEOUT)) {
+            assertThat(getValuesList(response), equalTo(List.of(List.of(5L))));
+        }
+    }
+
+    public void testMultipleDatasetViewsWithUnionAllSubquery() {
+        registerEmployees();
+        registerEmployeesAlt();
+        createView("view_eng", """
+            FROM
+                (FROM employees | WHERE department == "Engineering"),
+                (FROM employees_alt | WHERE department == "Engineering")
+            """);
+        createView("view_sales", """
+            FROM
+                (FROM employees | WHERE department == "Sales"),
+                (FROM employees_alt | WHERE department == "Sales")
+            """);
+        try (var response = run(syncEsqlQueryRequest("FROM view_eng, view_sales | STATS c = COUNT(*)"), TIMEOUT)) {
+            assertThat(getValuesList(response), equalTo(List.of(List.of(5L))));
+        }
+    }
+
+    public void testNestedDatasetViews() {
+        registerEmployees();
+        createView("emp_nested_view_1", "FROM employees");
+        createView("emp_nested_view_2", "FROM emp_nested_view_1");
+        createView("emp_nested_view_3", "FROM emp_nested_view_2");
+        try (var response = run(syncEsqlQueryRequest("FROM emp_nested_view_3 | SORT emp_no | KEEP emp_no, first_name"), TIMEOUT)) {
+            assertThat(getValuesList(response), equalTo(List.of(List.of(1, "Alice"), List.of(2, "Bob"), List.of(3, "Carol"))));
+        }
+    }
+
+    public void testDatasetViewAndRegularIndex() {
+        registerEmployees();
+        createRealEmployees();
+        createView("emp_ds_view", "FROM employees");
+        try (var response = run(syncEsqlQueryRequest("FROM emp_ds_view, real_employees | STATS c = COUNT(*)"), TIMEOUT)) {
+            assertThat(getValuesList(response), equalTo(List.of(List.of(8L))));
+        }
+    }
+
+    public void testDatasetViewAndDataset() {
+        registerEmployees();
+        createView("emp_ds_view", "FROM employees");
+        try (var response = run(syncEsqlQueryRequest("FROM emp_ds_view, employees | STATS c = COUNT(*)"), TIMEOUT)) {
+            assertThat(getValuesList(response), equalTo(List.of(List.of(6L))));
+        }
+    }
+
+    public void testConflictingTypesResolvedByCastInsideDatasetView() {
+        registerSalariesInt();
+        registerSalariesLong();
+        createView("view_int_cast", "FROM salaries_int | EVAL salary = salary::long");
+        createView("view_long", "FROM salaries_long");
+        try (var response = run(syncEsqlQueryRequest("FROM view_int_cast, view_long | SORT salary"), TIMEOUT)) {
+            validateSalaryUnion(response);
+        }
+    }
+
+    public void testDatasetViewsWithDifferentColumnsFillNulls() {
+        registerEmployees();
+        registerSalariesInt();
+        createView("view_first_name", "FROM employees | KEEP emp_no, first_name");
+        createView("view_name", "FROM salaries_int | KEEP emp_no, name");
+        try (var response = run(syncEsqlQueryRequest("""
+            FROM view_first_name, view_name
+            | SORT emp_no, first_name
+            | KEEP emp_no, first_name, name
+            """), TIMEOUT)) {
+            assertColumnNames(response.columns(), List.of("emp_no", "first_name", "name"));
+            assertThat(
+                getValuesList(response),
+                equalTo(
+                    Arrays.asList(
+                        Arrays.asList(1, "Alice", null),
+                        Arrays.asList(1, null, "Alice"),
+                        Arrays.asList(2, "Bob", null),
+                        Arrays.asList(2, null, "Bob"),
+                        Arrays.asList(3, "Carol", null)
+                    )
+                )
+            );
+        }
+    }
+
+    // wildcard
+
+    public void testWildcardDatasetViews() {
+        registerEmployees();
+        registerEmployeesAlt();
+        createView("emp_view_a", "FROM employees");
+        createView("emp_view_b", "FROM employees_alt");
+        try (var response = run(syncEsqlQueryRequest("SET wildcards_match_views = true; FROM emp_view_* | STATS c = COUNT(*)"), TIMEOUT)) {
+            assertThat(getValuesList(response), equalTo(List.of(List.of(5L))));
+        }
+    }
+
+    public void testWildcardDatasets() {
+        registerEmployees();
+        createView("emp_view_a", "FROM employees");
+        createView("emp_view_b", "FROM employees");
+        try (
+            var response = run(syncEsqlQueryRequest("SET wildcards_match_datasets = true; FROM emp_view_* | STATS c = COUNT(*)"), TIMEOUT)
+        ) {
+            assertThat(getValuesList(response), equalTo(List.of(List.of(0L))));
+        }
+    }
+
+    public void testDatasetWildcardView() {
+        registerEmployees();
+        registerEmployeesAlt();
+        createView("emp_view_a", "FROM employees_alt");
+        try (
+            var response = run(
+                syncEsqlQueryRequest("SET wildcards_match_views = true; FROM employees, emp_view_* | STATS c = COUNT(*)"),
+                TIMEOUT
+            )
+        ) {
+            assertThat(getValuesList(response), equalTo(List.of(List.of(5L))));
+        }
+    }
+
+    public void testWildcardViewExclusion() {
+        registerEmployees();
+        registerEmployeesAlt();
+        createView("emp_view_a", "FROM employees");
+        createView("emp_view_b", "FROM employees_alt");
+        try (
+            var response = run(
+                syncEsqlQueryRequest("SET wildcards_match_views = true; FROM emp_view_*,-emp_view_b | STATS c = COUNT(*)"),
+                TIMEOUT
+            )
+        ) {
+            assertThat(getValuesList(response), equalTo(List.of(List.of(3L))));
+        }
+    }
+
+    // TODO double check if this behavior is as expected
+    public void testWildcardMatchesViewAndDataset() {
+        registerEmployees();
+        registerEmployeesAlt();
+        createView("employees_view", "FROM employees_alt");
+        // A wildcard that matches a view is consumed by view resolution and is not also rewritten to datasets, so only the view's
+        // employees_alt rows remain.
+        try (var response = run(syncEsqlQueryRequest("""
+            SET wildcards_match_views = true;
+            SET wildcards_match_datasets = true;
+            FROM employees*
+            | STATS c = COUNT(*)
+            """), TIMEOUT)) {
+            assertThat(getValuesList(response), equalTo(List.of(List.of(2L))));
+        }
+    }
+
+    public void testWildcardDatasetsIgnoresMatchingView() {
+        registerEmployees();
+        registerEmployeesAlt();
+        createView("employees_view", "FROM employees_alt");
+        // wildcards_match_views defaults to false, so employees* reaches the two datasets and not the view.
+        try (
+            var response = run(syncEsqlQueryRequest("SET wildcards_match_datasets = true; FROM employees* | STATS c = COUNT(*)"), TIMEOUT)
+        ) {
+            assertThat(getValuesList(response), equalTo(List.of(List.of(5L))));
+        }
+    }
+
+    // Moved from FromDatasetIT
+
+    public void testViewOverMappedDatasetPreservesCoercion() throws IOException {
+        Path mappedCsv = createTempFile("dataset-view-mapped-", ".csv");
+        Files.writeString(mappedCsv, "val:integer\n100\n");
+        LinkedHashMap<String, DatasetFieldMapping> properties = new LinkedHashMap<>();
+        properties.put("val", new DatasetFieldMapping("long", null));
+        registerNonStrictDataset("mapped_ds_for_view", mappedCsv.toUri().toString(), properties, Map.of("format", "csv"));
+        createView("mapped_dataset_view", "FROM mapped_ds_for_view");
+        try (var response = run(syncEsqlQueryRequest("FROM mapped_dataset_view | KEEP val | LIMIT 1"), TIMEOUT)) {
+            assertThat("declared type must survive view inlining", response.columns().get(0).outputType(), equalTo("long"));
+            assertThat(getValuesList(response).get(0).get(0), equalTo(100L));
+        }
+    }
+
+    // dataset view with fork, moved from FromDatasetIT and FromDatasetSubqueryIT
+
+    public void testForkOverCompactedDatasetViews() {
+        registerEmployees();
+        registerEmployeesAlt();
+        createView("fork_dataset_view", "FROM employees, employees_alt");
+        createView("fork_dataset_view_a", "FROM employees");
+        createView("fork_dataset_view_b", "FROM employees_alt");
+
+        for (String source : List.of(
+            "fork_dataset_view",
+            "fork_dataset_view_a, employees_alt",
+            "fork_dataset_view_a, fork_dataset_view_b"
+        )) {
+            String query = "FROM " + source + """
+                 | FORK
+                     (STATS count = COUNT(*))
+                     (WHERE emp_no >= 10 | STATS count = COUNT(*))
+                 | KEEP _fork, count
+                 | SORT _fork
+                """;
+            try (var response = run(syncEsqlQueryRequest(query), TIMEOUT)) {
+                List<List<Object>> rows = getValuesList(response);
+                assertThat(rows, hasSize(2));
+                assertThat(rows.get(0).get(1), equalTo(5L));
+                assertThat(rows.get(1).get(1), equalTo(2L));
+            }
+        }
+
+        try (var response = run(syncEsqlQueryRequest("""
+            FROM fork_dataset_view, employees
+             | FORK
+                 (STATS count = COUNT(*))
+                 (WHERE emp_no >= 10 | STATS count = COUNT(*))
+             | KEEP _fork, count
+             | SORT _fork
+            """), TIMEOUT)) {
+            List<List<Object>> rows = getValuesList(response);
+            assertThat(rows, hasSize(2));
+            assertThat(rows.get(0).get(1), equalTo(8L));
+            assertThat(rows.get(1).get(1), equalTo(2L));
+        }
+    }
+
+    public void testForkAfterDatasetView() {
+        registerEmployees();
+        createView("emp_ds_view", "FROM employees");
+        try (var response = run(syncEsqlQueryRequest("""
+            FROM emp_ds_view
+            | FORK (WHERE emp_no <= 2) (WHERE emp_no > 2)
+            | KEEP _fork, emp_no
+            | SORT _fork, emp_no
+            """), TIMEOUT)) {
+            assertThat(getValuesList(response), equalTo(List.of(List.of("fork1", 1), List.of("fork1", 2), List.of("fork2", 3))));
+        }
+    }
+
+    public void testForkInsideDatasetView() {
+        registerEmployees();
+        createView("emp_fork_view", "FROM employees | FORK (WHERE emp_no <= 2) (WHERE emp_no > 2)");
+        try (var response = run(syncEsqlQueryRequest("""
+            FROM emp_fork_view
+            | STATS c = COUNT(*) BY _fork
+            | KEEP _fork, c
+            | SORT _fork
+            """), TIMEOUT)) {
+            List<List<Object>> rows = getValuesList(response);
+            assertThat(rows, hasSize(2));
+            assertThat(rows.get(0).get(0).toString(), equalTo("fork1"));
+            assertThat(rows.get(0).get(1), equalTo(2L));
+            assertThat(rows.get(1).get(0).toString(), equalTo("fork2"));
+            assertThat(rows.get(1).get(1), equalTo(1L));
+        }
+    }
+
+    public void testForkAfterSubqueryDatasetView() {
+        registerEmployees();
+        registerEmployeesAlt();
+        createView("emp_alt_view", "FROM employees_alt");
+        try (var response = run(syncEsqlQueryRequest("""
+            FROM (FROM employees), emp_alt_view
+            | FORK (WHERE emp_no < 10) (WHERE emp_no >= 10)
+            | STATS c = COUNT(*) BY _fork
+            | KEEP _fork, c
+            | SORT _fork
+            """), TIMEOUT)) {
+            List<List<Object>> rows = getValuesList(response);
+            assertThat(rows, hasSize(2));
+            assertThat(rows.get(0).get(0).toString(), equalTo("fork1"));
+            assertThat(rows.get(0).get(1), equalTo(3L));
+            assertThat(rows.get(1).get(0).toString(), equalTo("fork2"));
+            assertThat(rows.get(1).get(1), equalTo(2L));
+        }
+    }
+
+    public void testForkInsideSubqueryInsideDatasetView() {
+        registerEmployees();
+        registerEmployeesAlt();
+        // _fork only exists on the first branch, so the second branch's rows get a null _fork.
+        createView("emp_subquery_fork_view", """
+            FROM (FROM employees | FORK (WHERE emp_no <= 2) (WHERE emp_no > 2)),
+                 (FROM employees_alt)
+            """);
+        try (var response = run(syncEsqlQueryRequest("""
+            FROM emp_subquery_fork_view
+            | STATS c = COUNT(*) BY _fork
+            | KEEP _fork, c
+            | SORT _fork
+            """), TIMEOUT)) {
+            List<List<Object>> rows = getValuesList(response);
+            assertThat(rows, hasSize(3));
+            assertThat(rows.get(0).get(0).toString(), equalTo("fork1"));
+            assertThat(rows.get(0).get(1), equalTo(2L));
+            assertThat(rows.get(1).get(0).toString(), equalTo("fork2"));
+            assertThat(rows.get(1).get(1), equalTo(1L));
+            assertThat(rows.get(2).get(0), nullValue());
+            assertThat(rows.get(2).get(1), equalTo(2L));
+        }
+    }
+
+    public void testViewReferencingForkDatasetInSubquery() {
+        registerEmployees();
+        registerEmployeesAlt();
+        createView("emp_fork_view", "FROM employees | FORK (WHERE emp_no <= 2) (WHERE emp_no > 2)");
+        try (var response = run(syncEsqlQueryRequest("""
+            FROM (FROM emp_fork_view),
+                 (FROM employees_alt | WHERE emp_no == 10 | EVAL _fork = "fork1")
+            | STATS c = COUNT(*) BY _fork
+            | KEEP _fork, c
+            | SORT _fork
+            """), TIMEOUT)) {
+            List<List<Object>> rows = getValuesList(response);
+            assertThat(rows, hasSize(2));
+            assertThat(rows.get(0).get(0).toString(), equalTo("fork1"));
+            assertThat(rows.get(0).get(1), equalTo(3L));
+            assertThat(rows.get(1).get(0).toString(), equalTo("fork2"));
+            assertThat(rows.get(1).get(1), equalTo(1L));
+        }
+    }
+
+    // metadata
+    // TODO double check if this behavior is as expected
+    public void testClassAndNameUnknownOnDatasetView() {
+        registerEmployees();
+        createView("emp_ds_view", "FROM employees");
+        // Outer METADATA is not attached to a lone view; KEEP is what surfaces Unknown column.
+        Exception ex = expectThrows(
+            Exception.class,
+            () -> run(syncEsqlQueryRequest("FROM emp_ds_view METADATA _class, _name | KEEP _class, _name | LIMIT 1"), TIMEOUT)
+        );
+        assertCauseMessageContains(ex, "Unknown column");
+    }
+
+    public void testClassAndNameNullOnDatasetViewAndDataset() {
+        registerEmployees();
+        createView("emp_ds_view", "FROM employees");
+        try (var response = run(syncEsqlQueryRequest("""
+            FROM emp_ds_view, employees METADATA _class, _name
+            | KEEP emp_no, _class, _name
+            """), TIMEOUT)) {
+            List<List<Object>> rows = getValuesList(response);
+            assertThat(rows, hasSize(6));
+            long datasetRows = rows.stream().filter(r -> "dataset".equals(String.valueOf(r.get(1)))).count();
+            long viewRows = rows.stream().filter(r -> r.get(1) == null).count();
+            assertThat(datasetRows, equalTo(3L));
+            assertThat(viewRows, equalTo(3L));
+            for (List<Object> row : rows) {
+                if (row.get(1) == null) {
+                    assertThat(row.get(2), nullValue());
+                } else {
+                    assertThat(row.get(1).toString(), equalTo("dataset"));
+                    assertThat(row.get(2).toString(), equalTo("employees"));
+                }
+            }
+        }
+    }
+
+    public void testClassAndNameInViewBody() {
+        registerEmployees();
+        createView("emp_class_name_view", "FROM employees METADATA _class, _name");
+        try (var response = run(syncEsqlQueryRequest("FROM emp_class_name_view | KEEP _class, _name | LIMIT 1"), TIMEOUT)) {
+            assertThat(getValuesList(response), equalTo(List.of(List.of("dataset", "employees"))));
+        }
+    }
+
+    public void testFileMetadataThroughViewBody() {
+        registerEmployees();
+        createView("emp_file_meta_view", "FROM employees METADATA _index, _file.path, _file.name");
+        for (String query : List.of("FROM emp_file_meta_view | LIMIT 1", "FROM (FROM emp_file_meta_view) | LIMIT 1")) {
+            try (var response = run(syncEsqlQueryRequest(query), TIMEOUT)) {
+                List<String> names = response.columns().stream().map(ColumnInfo::name).toList();
+                assertThat(query + " must surface _index without KEEP, got " + names, names, hasItem("_index"));
+                assertThat(query + " must surface _file.path without KEEP, got " + names, names, hasItem("_file.path"));
+                assertThat(names, hasItem("_file.name"));
+                List<Object> row = getValuesList(response).get(0);
+                assertThat(row.get(names.indexOf("_index")), nullValue());
+                assertThat(row.get(names.indexOf("_file.path")).toString(), containsString(".csv"));
+                assertThat(row.get(names.indexOf("_file.name")), notNullValue());
+            }
+        }
+    }
+
+    // request filter
+
+    public void testRequestFilterFieldExistsOnDatasetView() {
+        registerEmployees();
+        createView("emp_ds_view", "FROM employees");
+
+        var term = syncEsqlQueryRequest("FROM emp_ds_view | SORT emp_no | KEEP emp_no, first_name");
+        term.filter(QueryBuilders.termQuery("emp_no", 2));
+        try (var response = run(term, TIMEOUT)) {
+            assertThat(getValuesList(response), equalTo(List.of(List.of(2, "Bob"))));
+        }
+
+        var range = syncEsqlQueryRequest("FROM emp_ds_view | SORT emp_no | KEEP emp_no, first_name");
+        range.filter(QueryBuilders.rangeQuery("emp_no").gte(2));
+        try (var response = run(range, TIMEOUT)) {
+            assertThat(getValuesList(response), equalTo(List.of(List.of(2, "Bob"), List.of(3, "Carol"))));
+        }
+
+        var exists = syncEsqlQueryRequest("FROM emp_ds_view | SORT emp_no | KEEP emp_no");
+        exists.filter(QueryBuilders.existsQuery("first_name"));
+        try (var response = run(exists, TIMEOUT)) {
+            assertThat(getValuesList(response), equalTo(List.of(List.of(1), List.of(2), List.of(3))));
+        }
+    }
+
+    public void testRequestFilterFieldMissingOnDatasetView() {
+        registerEmployees();
+        createView("emp_ds_view", "FROM employees");
+
+        var mustMissing = syncEsqlQueryRequest("FROM emp_ds_view | SORT emp_no");
+        mustMissing.filter(QueryBuilders.termQuery("nonexistent", "x"));
+        try (var response = run(mustMissing, TIMEOUT)) {
+            assertThat(getValuesList(response), hasSize(0));
+        }
+
+        var mustNotMissing = syncEsqlQueryRequest("FROM emp_ds_view | SORT emp_no");
+        mustNotMissing.filter(QueryBuilders.boolQuery().mustNot(QueryBuilders.termQuery("nonexistent", "x")));
+        try (var response = run(mustNotMissing, TIMEOUT)) {
+            assertThat(getValuesList(response), hasSize(3));
+        }
+    }
+
+    public void testRequestFilterOnStatsInsideDatasetView() {
+        registerEmployees();
+        createView("emp_stats_view", "FROM employees | STATS c = COUNT(*) BY department");
+
+        // Source-field filters still bind to the dataset (view DSL filtering is not yet view-output).
+        var sourceField = syncEsqlQueryRequest("FROM emp_stats_view | KEEP department, c | SORT department");
+        sourceField.filter(QueryBuilders.termQuery("department", "Engineering"));
+        try (var response = run(sourceField, TIMEOUT)) {
+            assertThat(getValuesList(response), equalTo(List.of(List.of("Engineering", 2L))));
+        }
+
+        // Computed view-output fields are not present on the source, so the filter drops every row.
+        var computed = syncEsqlQueryRequest("FROM emp_stats_view | KEEP department, c");
+        computed.filter(QueryBuilders.rangeQuery("c").gte(2));
+        try (var response = run(computed, TIMEOUT)) {
+            assertThat(getValuesList(response), hasSize(0));
+        }
+    }
+
+    public void testRequestFilterOnEvalInsideDatasetView() {
+        registerEmployees();
+        createView("emp_eval_view", "FROM employees | EVAL doubled = emp_no * 2");
+
+        var sourceField = syncEsqlQueryRequest("FROM emp_eval_view | KEEP emp_no, doubled | SORT emp_no");
+        sourceField.filter(QueryBuilders.termQuery("emp_no", 1));
+        try (var response = run(sourceField, TIMEOUT)) {
+            assertThat(getValuesList(response), equalTo(List.of(List.of(1, 2))));
+        }
+
+        var computed = syncEsqlQueryRequest("FROM emp_eval_view | KEEP emp_no, doubled | SORT emp_no");
+        computed.filter(QueryBuilders.termQuery("doubled", 2));
+        try (var response = run(computed, TIMEOUT)) {
+            assertThat(getValuesList(response), hasSize(0));
+        }
+    }
+
+    public void testRequestFilterOnUnionSubqueryInsideDatasetView() {
+        registerEmployees();
+        registerEmployeesAlt();
+        createView("emp_union_view", "FROM (FROM employees), (FROM employees_alt)");
+        var request = syncEsqlQueryRequest("FROM emp_union_view | KEEP emp_no | SORT emp_no");
+        request.filter(QueryBuilders.rangeQuery("emp_no").gte(10));
+        try (var response = run(request, TIMEOUT)) {
+            assertThat(getValuesList(response), equalTo(List.of(List.of(10), List.of(11))));
+        }
+    }
+
+    public void testRequestFilterOnForkAfterSubqueryDatasetView() {
+        registerEmployees();
+        registerEmployeesAlt();
+        createView("emp_alt_view", "FROM employees_alt");
+        var request = syncEsqlQueryRequest("""
+            FROM (FROM employees), emp_alt_view
+            | FORK (WHERE emp_no < 10) (WHERE emp_no >= 10)
+            | STATS c = COUNT(*) BY _fork
+            | KEEP _fork, c
+            | SORT _fork
+            """);
+        request.filter(QueryBuilders.rangeQuery("emp_no").gte(2));
+        try (var response = run(request, TIMEOUT)) {
+            List<List<Object>> rows = getValuesList(response);
+            assertThat(rows, hasSize(2));
+            assertThat(rows.get(0).get(0).toString(), equalTo("fork1"));
+            assertThat(rows.get(0).get(1), equalTo(2L));
+            assertThat(rows.get(1).get(0).toString(), equalTo("fork2"));
+            assertThat(rows.get(1).get(1), equalTo(2L));
+        }
+    }
+
+    public void testRequestFilterOnMixedDatasetViewDatasetRegularIndex() {
+        registerEmployees();
+        registerEmployeesAlt();
+        createRealEmployees();
+        createView("emp_fork_view", "FROM employees | FORK (WHERE emp_no <= 2) (WHERE emp_no > 2)");
+        var request = syncEsqlQueryRequest("""
+            FROM emp_fork_view, (FROM employees_alt), real_employees
+            | KEEP emp_no
+            | SORT emp_no
+            """);
+        request.filter(QueryBuilders.rangeQuery("emp_no").gte(3));
+        try (var response = run(request, TIMEOUT)) {
+            assertThat(
+                getValuesList(response),
+                equalTo(List.of(List.of(3), List.of(3), List.of(10), List.of(11), List.of(99), List.of(100), List.of(101)))
+            );
+        }
+    }
+
+    // negative tests
+
+    public void testDatasetViewRejectedAsTSSource() {
+        registerEmployees();
+        createView("emp_ds_view", "FROM employees");
+        Exception ex = expectThrows(Exception.class, () -> run(syncEsqlQueryRequest("TS emp_ds_view | LIMIT 1"), TIMEOUT));
+        // View resolution rejects the view name before DatasetRewriter can see the inner dataset.
+        assertCauseMessageContains(ex, "Views are not supported in TS command");
+    }
+
+    public void testDatasetViewRejectedAsRHSOfLookupJoin() {
+        registerEmployees();
+        createRealEmployees();
+        createView("emp_ds_view", "FROM employees");
+        Exception ex = expectThrows(
+            Exception.class,
+            () -> run(syncEsqlQueryRequest("FROM real_employees | LOOKUP JOIN emp_ds_view ON emp_no | LIMIT 1"), TIMEOUT)
+        );
+        // LOOKUP JOIN does not expand a view target, so the dataset rewriter never fires; the
+        // view name is resolved as a missing index instead.
+        assertCauseMessageContains(ex, "Unknown index [emp_ds_view]");
+    }
+
+    public void testDatasetViewRejectedByKQL() {
+        registerEmployees();
+        createView("emp_ds_view", "FROM employees");
+        Exception ex = expectThrows(
+            Exception.class,
+            () -> run(syncEsqlQueryRequest("FROM emp_ds_view | WHERE KQL(\"first_name: Alice\")"), TIMEOUT)
+        );
+        assertCauseMessageContains(
+            ex,
+            "[KQL] function is not supported on federated data sources [employees]; it requires an index. "
+                + "Use MATCH(field, \"term\") for full-text search on non-indexed data."
+        );
+    }
+
+    public void testDatasetViewRejectedByQSTR() {
+        registerEmployees();
+        createView("emp_ds_view", "FROM employees");
+        Exception ex = expectThrows(
+            Exception.class,
+            () -> run(syncEsqlQueryRequest("FROM emp_ds_view | WHERE QSTR(\"first_name: Alice\")"), TIMEOUT)
+        );
+        assertCauseMessageContains(
+            ex,
+            "[QSTR] function is not supported on federated data sources [employees]; it requires an index. "
+                + "Use MATCH(field, \"term\") for full-text search on non-indexed data."
+        );
+    }
+
+    public void testMissingDatasetInsideViewIsUnknownIndex() {
+        createView("emp_missing_view", "FROM missing_employees");
+        Exception ex = expectThrows(Exception.class, () -> run(syncEsqlQueryRequest("FROM emp_missing_view | LIMIT 1"), TIMEOUT));
+        assertCauseMessageContains(ex, "Unknown index [missing_employees]");
+    }
+
+    public void testConflictingTypesAcrossDatasetViewsRejected() {
+        registerSalariesInt();
+        registerSalariesLong();
+        createView("view_int", "FROM salaries_int");
+        createView("view_long", "FROM salaries_long");
+        Exception ex = expectThrows(Exception.class, () -> run(syncEsqlQueryRequest("FROM view_int, view_long | SORT salary"), TIMEOUT));
+        assertCauseMessageContains(ex, "Column [salary] has conflicting data types in subqueries");
+    }
+
+    public void testConflictingKeywordAndNumericTypesAcrossDatasetViewsRejected() {
+        registerSalariesInt();
+        registerSalariesKeyword();
+        createView("view_int", "FROM salaries_int");
+        createView("view_keyword", "FROM salaries_keyword");
+        Exception ex = expectThrows(Exception.class, () -> run(syncEsqlQueryRequest("FROM view_int, view_keyword | SORT salary"), TIMEOUT));
+        assertCauseMessageContains(ex, "Column [salary] has conflicting data types in subqueries");
+    }
+
+    public void testDatasetViewExceedsMaxBranchCount() {
+        registerEmployees();
+        registerEmployeesAlt();
+        for (int i = 1; i <= 5; i++) {
+            createView("branch_view_" + i, "FROM (FROM employees), (FROM employees_alt)");
+        }
+        var tightCount = new QueryPragmas(Settings.builder().put(QueryPragmas.MAX_BRANCH_COUNT.getKey(), 8).build());
+        expectThrows(
+            VerificationException.class,
+            containsString("exceeding the limit of 8"),
+            () -> run(
+                syncEsqlQueryRequest("FROM branch_view_1, branch_view_2, branch_view_3, branch_view_4, branch_view_5 | STATS c = COUNT(*)")
+                    .pragmas(tightCount),
+                TIMEOUT
+            ).close()
+        );
+    }
+
+    public void testDatasetViewExceedsMaxBranchLevel() {
+        registerEmployees();
+        registerEmployeesAlt();
+        createView("emp_eval_union_view", "FROM (FROM employees), (FROM employees_alt) | EVAL tag = 1");
+        var tightLevel = new QueryPragmas(Settings.builder().put(QueryPragmas.MAX_BRANCH_LEVEL.getKey(), 1).build());
+        expectThrows(
+            VerificationException.class,
+            containsString("nested union levels"),
+            () -> run(syncEsqlQueryRequest("FROM emp_eval_union_view, employees | KEEP emp_no").pragmas(tightLevel), TIMEOUT).close()
+        );
+    }
+
+    // helpers
+
+    private void registerEmployees() {
+        registerDataSource("local_ds", Map.of());
+        registerDataset("employees", "local_ds", csvFixture.toUri().toString(), Map.of("format", "csv"));
+    }
+
+    private void registerEmployeesAlt() {
+        registerDataset("employees_alt", "local_ds", csvFixtureAlt.toUri().toString(), Map.of("format", "csv"));
+    }
+
+    private void registerSalariesInt() {
+        registerDataSource("local_ds", Map.of());
+        registerDataset("salaries_int", "local_ds", csvFixtureSalaryInt.toUri().toString(), Map.of("format", "csv"));
+    }
+
+    private void registerSalariesLong() {
+        registerDataset("salaries_long", "local_ds", csvFixtureSalaryLong.toUri().toString(), Map.of("format", "csv"));
+    }
+
+    private void registerSalariesKeyword() {
+        registerDataSource("local_ds", Map.of());
+        registerDataset("salaries_keyword", "local_ds", csvFixtureSalaryKeyword.toUri().toString(), Map.of("format", "csv"));
+    }
+
+    private void createView(String name, String query) {
+        assertAcked(
+            client().execute(PutViewAction.INSTANCE, new PutViewAction.Request(TIMEOUT, TIMEOUT, new View(name, query))).actionGet(TIMEOUT)
+        );
+        createdViews.add(name);
+    }
+
+    private void createDepartmentsLookup() {
+        Settings lookupSettings = Settings.builder().put("index.number_of_shards", 1).put("index.mode", "lookup").build();
+        assertAcked(
+            client().admin()
+                .indices()
+                .prepareCreate("departments_lookup")
+                .setSettings(lookupSettings)
+                .setMapping("department", "type=keyword", "location", "type=keyword")
+        );
+        client().prepareIndex("departments_lookup").setSource("department", "Engineering", "location", "Mountain View").get();
+        client().prepareIndex("departments_lookup").setSource("department", "Sales", "location", "New York").get();
+        client().admin().indices().prepareRefresh("departments_lookup").get();
+    }
+
+    private void createRealEmployees() {
+        assertAcked(
+            client().admin().indices().prepareCreate("real_employees").setMapping("emp_no", "type=integer", "first_name", "type=keyword")
+        );
+        ensureGreen("real_employees");
+        client().prepareIndex("real_employees").setSource("emp_no", 1, "first_name", "Alice-real").get();
+        client().prepareIndex("real_employees").setSource("emp_no", 3, "first_name", "Carol-real").get();
+        client().prepareIndex("real_employees").setSource("emp_no", 99, "first_name", "Zach-real").get();
+        client().prepareIndex("real_employees").setSource("emp_no", 100, "first_name", "Frank").get();
+        client().prepareIndex("real_employees").setSource("emp_no", 101, "first_name", "Grace").get();
+        client().admin().indices().prepareRefresh("real_employees").get();
+    }
+
+    private void validateSalaryUnion(EsqlQueryResponse response) {
+        List<? extends ColumnInfo> columns = response.columns();
+        assertThat(columns, hasSize(3));
+        assertThat(columns.get(0).name(), equalTo("emp_no"));
+        assertThat(columns.get(1).name(), equalTo("name"));
+        assertThat(columns.get(2).name(), equalTo("salary"));
+
+        List<List<Object>> rows = getValuesList(response);
+        assertThat(rows, hasSize(4));
+        assertThat(((Number) rows.get(0).get(2)).longValue(), equalTo(50000L));
+        assertThat(((Number) rows.get(1).get(2)).longValue(), equalTo(60000L));
+        assertThat(((Number) rows.get(2).get(2)).longValue(), equalTo(65000L));
+        assertThat(((Number) rows.get(3).get(2)).longValue(), equalTo(75000L));
+    }
+
+    private static void assertCauseMessageContains(Throwable throwable, String fragment) {
+        StringBuilder chain = new StringBuilder();
+        Throwable cause = throwable;
+        while (cause != null) {
+            if (cause.getMessage() != null) {
+                if (chain.isEmpty() == false) {
+                    chain.append(" | ");
+                }
+                chain.append(cause.getMessage());
+            }
+            cause = cause.getCause();
+        }
+        assertThat(chain.toString(), containsString(fragment));
+    }
+}
