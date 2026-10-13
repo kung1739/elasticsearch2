@@ -11,7 +11,6 @@ import org.elasticsearch.common.io.stream.StreamInput;
 import org.elasticsearch.common.io.stream.StreamOutput;
 import org.elasticsearch.common.io.stream.Writeable;
 import org.elasticsearch.core.Nullable;
-import org.elasticsearch.xpack.esql.datasources.spi.ErrorPolicy;
 
 import java.io.IOException;
 import java.util.Map;
@@ -116,27 +115,16 @@ public record DeclaredReadSpec(
     }
 
     /**
-     * True when reading this spec under {@code policy} can drop a whole row: the read asked for
-     * {@link ErrorPolicy.Mode#SKIP_ROW} <em>and</em> declares column types that a value can fail to coerce into.
-     * With no declared types there is nothing to coerce, so no row is ever dropped and {@code skip_row} is
-     * indistinguishable from {@code fail_fast} on the columnar readers.
+     * True when the mapping declared nothing that changes how a file's statistics map onto the read schema — no
+     * rename to rekey, no parse-format to poison, no declared type to differ from the file's own.
      * <p>
-     * This is the single predicate for that combination. It gates three independent decisions that must agree for
-     * one read — whether {@code PushFiltersToSource} pushes the filter, whether {@code InsertExternalFieldExtraction}
-     * inserts an {@code ExternalFieldExtractExec}, and whether the operator factory enables deferred extraction —
-     * because each of those moves the page's shape away from the point where the reader drops rows. Two of them are
-     * plan-time and one is execution-time, so any drift between them shows up as a plan the factory cannot honour.
-     * <p>
-     * Footer statistics need no such gate: {@code FileSplitProvider} already poisons declared-retyped and
-     * date-format columns out of the published stats (their pre-coercion extrema are untrustworthy), and the
-     * surviving {@code row_count} is what a {@code COUNT(*)} scan returns anyway — that scan projects no column, so
-     * nothing is decoded and no row can be dropped.
-     * <p>
-     * Keyed on the <b>logical</b> {@code declaredTypeColumns}; {@code FileSourceFactory} physicalizes the same set
-     * through the {@code path} renames for the by-name readers, which is a 1:1 map and so cannot change emptiness.
+     * Deliberately blind to {@link #provenance}, unlike {@link #isEmpty()}. The binding mode is an instruction to
+     * the text readers and has to survive the wire, which is why {@code isEmpty()} consults it; it says nothing
+     * about whether a footer statistic still describes the read. Asking {@code isEmpty()} here made the split-side
+     * statistics decision turn on whether a declaration existed (esql-planning#2076).
      */
-    public boolean dropsRowsOnCoercionFailure(ErrorPolicy policy) {
-        return policy.mode() == ErrorPolicy.Mode.SKIP_ROW && declaredTypeColumns.isEmpty() == false;
+    public boolean declaresNoStatsAffectingInstructions() {
+        return renames.isEmpty() && dateFormats.isEmpty() && declaredTypeColumns.isEmpty();
     }
 
     @Override
