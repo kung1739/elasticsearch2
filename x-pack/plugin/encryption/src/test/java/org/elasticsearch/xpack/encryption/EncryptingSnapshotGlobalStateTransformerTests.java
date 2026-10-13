@@ -12,9 +12,6 @@ import org.elasticsearch.cluster.NamedDiff;
 import org.elasticsearch.cluster.metadata.Metadata;
 import org.elasticsearch.cluster.metadata.ProjectId;
 import org.elasticsearch.cluster.metadata.ProjectMetadata;
-import org.elasticsearch.common.bytes.BytesArray;
-import org.elasticsearch.common.bytes.BytesReference;
-import org.elasticsearch.common.io.stream.BytesStreamOutput;
 import org.elasticsearch.common.io.stream.StreamInput;
 import org.elasticsearch.common.io.stream.StreamOutput;
 import org.elasticsearch.common.settings.SecureString;
@@ -137,11 +134,8 @@ public class EncryptingSnapshotGlobalStateTransformerTests extends ESTestCase {
         return new AesGcmEncryptionService(kp, () -> EncryptionServiceState.READY, () -> true);
     }
 
-    private static BytesReference sealedKey() {
-        return new EncryptingSnapshotGlobalStateTransformer().sealKey(
-            PROJECT_ID,
-            new SecureString(Arrays.copyOf(GOOD_PASSWORD, GOOD_PASSWORD.length))
-        );
+    private static SecureString password() {
+        return new SecureString(Arrays.copyOf(GOOD_PASSWORD, GOOD_PASSWORD.length));
     }
 
     /** Sets up registry + service + metadata with one SNAPSHOT-context custom. */
@@ -167,30 +161,13 @@ public class EncryptingSnapshotGlobalStateTransformerTests extends ESTestCase {
         Setup s = buildSetup();
         EncryptingSnapshotGlobalStateTransformer t = new EncryptingSnapshotGlobalStateTransformer();
 
-        Metadata result = t.transformForSnapshot(PROJECT_ID, s.metadata(), sealedKey());
+        Metadata result = t.transformForSnapshot(PROJECT_ID, s.metadata(), password());
 
         assertThat(result, not(sameInstance(s.metadata())));
         TestBlob rewrapped = (TestBlob) result.getProject(PROJECT_ID).custom(TestBlob.TYPE);
         assertNotNull(rewrapped);
         assertThat(rewrapped.blob.keyId(), equalTo(EncryptingSnapshotGlobalStateTransformer.SNAPSHOT_PASSWORD_KEY_ID));
         assertThat(PasswordBasedEncryption.unwrap(rewrapped.blob, GOOD_PASSWORD.clone()), equalTo(s.svc().decrypt(s.originalBlob())));
-    }
-
-    public void testSealedKeyIsEncryptedUnderActiveProjectKey() {
-        buildSetup();
-        BytesReference sealed = sealedKey();
-
-        assertThat(EncryptingSnapshotGlobalStateTransformer.sealedKeyId(sealed), equalTo("k1"));
-        assertThat(sealed, not(equalTo(sealedKey())));
-    }
-
-    public void testUnsealableKeyFailsInsteadOfDropping() throws IOException {
-        Setup s = buildSetup();
-        BytesStreamOutput out = new BytesStreamOutput();
-        new EncryptedData("retired-key", randomByteArrayOfLength(64)).writeTo(out);
-        EncryptingSnapshotGlobalStateTransformer t = new EncryptingSnapshotGlobalStateTransformer();
-
-        expectThrows(Exception.class, () -> t.transformForSnapshot(PROJECT_ID, s.metadata(), out.bytes()));
     }
 
     public void testWithoutPasswordDropsEncryptedCustom() {
@@ -208,8 +185,7 @@ public class EncryptingSnapshotGlobalStateTransformerTests extends ESTestCase {
         EncryptingSnapshotGlobalStateTransformer t = new EncryptingSnapshotGlobalStateTransformer();
 
         Metadata metadata = Metadata.builder().put(ProjectMetadata.builder(PROJECT_ID)).build();
-        BytesReference neverRead = randomBoolean() ? null : new BytesArray(randomByteArrayOfLength(8));
-        assertThat(t.transformForSnapshot(PROJECT_ID, metadata, neverRead), sameInstance(metadata));
+        assertThat(t.transformForSnapshot(PROJECT_ID, metadata, randomBoolean() ? null : password()), sameInstance(metadata));
     }
 
     public void testUnsetRegistryIsNoOp() {
@@ -217,7 +193,7 @@ public class EncryptingSnapshotGlobalStateTransformerTests extends ESTestCase {
         EncryptedDataHandlerRegistry.INSTANCE.set(null);
         EncryptingSnapshotGlobalStateTransformer t = new EncryptingSnapshotGlobalStateTransformer();
 
-        assertThat(t.transformForSnapshot(PROJECT_ID, s.metadata(), sealedKey()), sameInstance(s.metadata()));
+        assertThat(t.transformForSnapshot(PROJECT_ID, s.metadata(), password()), sameInstance(s.metadata()));
         assertThat(t.transformForSnapshot(PROJECT_ID, s.metadata(), null), sameInstance(s.metadata()));
         assertFalse(t.containsEncryptedData(PROJECT_ID, s.metadata()));
     }

@@ -19,6 +19,7 @@ import org.elasticsearch.core.Nullable;
 
 import java.io.IOException;
 import java.util.Map;
+import java.util.Objects;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
@@ -26,7 +27,8 @@ import java.util.stream.Collectors;
  * The {@code encrypted_data} block from a create-snapshot request. Carries a type discriminator
  * ({@value #TYPE_PASSWORD} or {@value #TYPE_SECURE_SETTING}) and type-specific fields.
  *
- * <p>Instances are master-local: the password must never travel in cluster state.
+ * <p>Stored on the in-progress snapshot so that any master can finalize it, so the password must never appear in
+ * {@link #toString()} or any XContent output.
  */
 public final class SnapshotEncryptedData implements Writeable {
 
@@ -93,6 +95,24 @@ public final class SnapshotEncryptedData implements Writeable {
     @Nullable
     public String passwordId() {
         return passwordId;
+    }
+
+    @Override
+    public boolean equals(Object o) {
+        if (this == o) return true;
+        if (o == null || getClass() != o.getClass()) return false;
+        SnapshotEncryptedData that = (SnapshotEncryptedData) o;
+        return type.equals(that.type) && Objects.equals(password, that.password) && Objects.equals(passwordId, that.passwordId);
+    }
+
+    @Override
+    public int hashCode() {
+        return Objects.hash(type, password, passwordId);
+    }
+
+    @Override
+    public String toString() {
+        return "SnapshotEncryptedData{type=" + type + ", passwordId=" + passwordId + "}";
     }
 
     /**

@@ -358,21 +358,17 @@ public final class SnapshotsService extends AbstractLifecycleComponent implement
             );
             return;
         }
-        final Snapshot snapshot = new Snapshot(projectId, repositoryName, snapshotId);
-        final SnapshotEncryptedData encryptedData = request.encryptedData();
-        if (encryptedData == null) {
-            submitCreateSnapshotRequest(request, listener, repository, snapshot, repository.getMetadata(), null);
+        if (request.encryptedData() != null && snapshotGlobalStateTransformer == SnapshotGlobalStateTransformer.NOOP) {
+            listener.onFailure(new IllegalArgumentException("[encrypted_data] is not supported by this cluster"));
             return;
         }
-        // sealing runs PBKDF2, which is too slow for the calling transport thread
-        threadPool.executor(ThreadPool.Names.SNAPSHOT_META).execute(ActionRunnable.wrap(listener, l -> {
-            final var encryptedDataKey = new SnapshotEncryptedDataKey(
-                encryptedData.type(),
-                encryptedData.passwordId(),
-                snapshotGlobalStateTransformer.sealKey(projectId, encryptedData.password())
-            );
-            submitCreateSnapshotRequest(request, l, repository, snapshot, repository.getMetadata(), encryptedDataKey);
-        }));
+        submitCreateSnapshotRequest(
+            request,
+            listener,
+            repository,
+            new Snapshot(projectId, repositoryName, snapshotId),
+            repository.getMetadata()
+        );
     }
 
     /**
@@ -383,15 +379,14 @@ public final class SnapshotsService extends AbstractLifecycleComponent implement
         ActionListener<Snapshot> listener,
         Repository repository,
         Snapshot snapshot,
-        RepositoryMetadata initialRepositoryMetadata,
-        @Nullable SnapshotEncryptedDataKey encryptedDataKey
+        RepositoryMetadata initialRepositoryMetadata
     ) {
         repository.getRepositoryData(
             EsExecutors.DIRECT_EXECUTOR_SERVICE, // Listener is lightweight, only submits a cluster state update task, no need to fork
             listener.delegateFailure(
                 (l, repositoryData) -> masterServiceTaskQueue.submitTask(
                     "create_snapshot [" + snapshot.getSnapshotId().getName() + ']',
-                    new CreateSnapshotTask(repository, repositoryData, l, snapshot, request, initialRepositoryMetadata, encryptedDataKey),
+                    new CreateSnapshotTask(repository, repositoryData, l, snapshot, request, initialRepositoryMetadata),
                     request.masterNodeTimeout()
                 )
             )
@@ -1099,15 +1094,15 @@ public final class SnapshotsService extends AbstractLifecycleComponent implement
             metadataListener.addListener(ActionListener.wrap(meta -> {
                 assert ThreadPool.assertCurrentThreadPool(ThreadPool.Names.SNAPSHOT);
                 Metadata metaForSnapshot = metadataForSnapshot(entry, meta, projectId);
-                final SnapshotEncryptedDataKey encryptedDataKey = entry.encryptedDataKey();
+                final SnapshotEncryptedData encryptedData = entry.encryptedData();
                 boolean encryptedDataIncluded = false;
                 if (entry.includeGlobalState()) {
                     final Metadata transformed = snapshotGlobalStateTransformer.transformForSnapshot(
                         projectId,
                         metaForSnapshot,
-                        encryptedDataKey == null ? null : encryptedDataKey.sealedKey()
+                        encryptedData == null ? null : encryptedData.password()
                     );
-                    encryptedDataIncluded = transformed != metaForSnapshot && encryptedDataKey != null;
+                    encryptedDataIncluded = transformed != metaForSnapshot && encryptedData != null;
                     metaForSnapshot = transformed;
                 }
 
@@ -1161,7 +1156,7 @@ public final class SnapshotsService extends AbstractLifecycleComponent implement
                     indexSnapshotDetails
                 );
                 final SnapshotInfo snapshotInfo = encryptedDataIncluded
-                    ? rawSnapshotInfo.withEncryptedData(encryptedDataKey.type(), encryptedDataKey.passwordId())
+                    ? rawSnapshotInfo.withEncryptedData(encryptedData.type(), encryptedData.passwordId())
                     : rawSnapshotInfo;
                 assert snapshotInfo.state() != null;
                 final boolean snapshotInfoStateInvariant = getSnapshotInfoStateInvariant(snapshotInfo);
@@ -2948,8 +2943,7 @@ public final class SnapshotsService extends AbstractLifecycleComponent implement
         ActionListener<Snapshot> listener,
         Snapshot snapshot,
         CreateSnapshotRequest createSnapshotRequest,
-        RepositoryMetadata initialRepositoryMetadata,
-        @Nullable SnapshotEncryptedDataKey encryptedDataKey
+        RepositoryMetadata initialRepositoryMetadata
     ) implements SnapshotTask {
 
         @Override
@@ -3004,8 +2998,7 @@ public final class SnapshotsService extends AbstractLifecycleComponent implement
                                     task.listener,
                                     task.repository,
                                     task.snapshot,
-                                    repoMeta,
-                                    task.encryptedDataKey
+                                    repoMeta
                                 )
                             );
                         }
@@ -3201,7 +3194,7 @@ public final class SnapshotsService extends AbstractLifecycleComponent implement
                 request.userMetadata(),
                 version,
                 List.copyOf(featureStates),
-                createSnapshotTask.encryptedDataKey()
+                request.encryptedData()
             );
             final var res = snapshotsInProgress.withAddedEntry(newEntry);
             taskContext.success(() -> {

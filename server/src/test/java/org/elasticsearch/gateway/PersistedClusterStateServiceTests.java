@@ -36,9 +36,11 @@ import org.apache.lucene.store.IndexOutput;
 import org.apache.lucene.store.NIOFSDirectory;
 import org.apache.lucene.tests.mockfile.ExtrasFS;
 import org.apache.lucene.util.Bits;
+import org.apache.lucene.util.BytesRef;
 import org.elasticsearch.Version;
 import org.elasticsearch.cluster.ClusterName;
 import org.elasticsearch.cluster.ClusterState;
+import org.elasticsearch.cluster.SnapshotsInProgress;
 import org.elasticsearch.cluster.coordination.CoordinationMetadata;
 import org.elasticsearch.cluster.metadata.DataStream;
 import org.elasticsearch.cluster.metadata.IndexMetadata;
@@ -53,7 +55,11 @@ import org.elasticsearch.cluster.routing.GlobalRoutingTableTestHelper;
 import org.elasticsearch.cluster.routing.RoutingTable;
 import org.elasticsearch.common.Randomness;
 import org.elasticsearch.common.UUIDs;
+import org.elasticsearch.common.bytes.BytesArray;
+import org.elasticsearch.common.bytes.BytesReference;
+import org.elasticsearch.common.compress.CompressorFactory;
 import org.elasticsearch.common.settings.ClusterSettings;
+import org.elasticsearch.common.settings.SecureString;
 import org.elasticsearch.common.settings.Settings;
 import org.elasticsearch.common.unit.ByteSizeValue;
 import org.elasticsearch.core.IOUtils;
@@ -67,6 +73,9 @@ import org.elasticsearch.index.Index;
 import org.elasticsearch.index.IndexVersion;
 import org.elasticsearch.index.IndexVersions;
 import org.elasticsearch.index.mapper.MapperService;
+import org.elasticsearch.snapshots.Snapshot;
+import org.elasticsearch.snapshots.SnapshotEncryptedData;
+import org.elasticsearch.snapshots.SnapshotId;
 import org.elasticsearch.test.CorruptionUtils;
 import org.elasticsearch.test.ESTestCase;
 import org.elasticsearch.test.MockLog;
@@ -74,6 +83,7 @@ import org.elasticsearch.test.junit.annotations.TestLogging;
 
 import java.io.IOError;
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.DirectoryStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -112,6 +122,7 @@ import static org.hamcrest.Matchers.endsWith;
 import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.is;
 import static org.hamcrest.Matchers.lessThan;
+import static org.hamcrest.Matchers.not;
 import static org.hamcrest.Matchers.nullValue;
 import static org.hamcrest.Matchers.startsWith;
 
@@ -1972,6 +1983,86 @@ public class PersistedClusterStateServiceTests extends ESTestCase {
             assertThat(onDiskState.clusterUUID, is(equalTo(clusterUUID)));
             assertThat(onDiskState.clusterUUIDCommitted, is(clusterUUIDCommitted));
         }
+    }
+
+    /**
+     * In-progress snapshots carry their {@code encrypted_data} password in cluster state so that any master can finalize them. That is
+     * only acceptable because {@link SnapshotsInProgress} is never written to disk; this test fails if that changes. A canary in the
+     * persistent settings verifies that the scan can see persisted data.
+     */
+    public void testDoesNotPersistSnapshotEncryptedDataPassword() throws IOException {
+        final String password = randomAlphaOfLength(32);
+        final String canary = randomValueOtherThan(password, () -> randomAlphaOfLength(32));
+        final SnapshotsInProgress.Entry entry = SnapshotsInProgress.startedEntry(
+            new Snapshot(ProjectId.DEFAULT, "repo", new SnapshotId("snap", UUIDs.randomBase64UUID(random()))),
+            true,
+            false,
+            Map.of(),
+            List.of(),
+            0L,
+            0L,
+            Map.of(),
+            Map.of(),
+            IndexVersion.current(),
+            List.of(),
+            new SnapshotEncryptedData(SnapshotEncryptedData.TYPE_PASSWORD, new SecureString(password.toCharArray()), null)
+        );
+        final ClusterState previousState = ClusterState.builder(ClusterName.DEFAULT)
+            .metadata(Metadata.builder().persistentSettings(Settings.builder().put("canary", canary).build()))
+            .build();
+        final ClusterState clusterState = ClusterState.builder(previousState)
+            .putCustom(SnapshotsInProgress.TYPE, SnapshotsInProgress.EMPTY.withAddedEntry(entry))
+            .incrementVersion()
+            .build();
+
+        try (NodeEnvironment nodeEnvironment = newNodeEnvironment(createDataPaths())) {
+            // default page size, so that every compressed document fits in a single page
+            final PersistedClusterStateService persistedClusterStateService = new PersistedClusterStateService(
+                nodeEnvironment,
+                xContentRegistry(),
+                new ClusterSettings(Settings.EMPTY, ClusterSettings.BUILT_IN_CLUSTER_SETTINGS),
+                () -> 0L,
+                ESTestCase::randomBoolean
+            );
+            try (Writer writer = persistedClusterStateService.createWriter()) {
+                writer.writeFullStateAndCommit(0L, previousState);
+                writer.writeIncrementalStateAndCommit(0L, previousState, clusterState);
+                writer.writeFullStateAndCommit(0L, clusterState);
+            }
+
+            for (Path dataPath : nodeEnvironment.nodeDataPaths()) {
+                final String persisted = readAllStoredFields(dataPath.resolve(METADATA_DIRECTORY_NAME));
+                assertThat(persisted, containsString(canary));
+                assertThat(persisted, not(containsString(password)));
+            }
+        }
+    }
+
+    /**
+     * Returns every stored field of every document, including deleted ones, decompressed where needed.
+     */
+    private static String readAllStoredFields(Path metadataDirectory) throws IOException {
+        final StringBuilder result = new StringBuilder();
+        try (Directory directory = new NIOFSDirectory(metadataDirectory); DirectoryReader reader = DirectoryReader.open(directory)) {
+            for (LeafReaderContext leafReaderContext : reader.leaves()) {
+                final StoredFields storedFields = leafReaderContext.reader().storedFields();
+                for (int docId = 0; docId < leafReaderContext.reader().maxDoc(); docId++) {
+                    final Document document = storedFields.document(docId);
+                    assertThat(document.getField(PAGE_FIELD_NAME).numericValue().intValue(), equalTo(0));
+                    for (IndexableField field : document.getFields()) {
+                        final BytesRef bytes = field.binaryValue();
+                        if (bytes != null) {
+                            // SMILE is not valid UTF-8; a 1:1 byte-to-char mapping still exposes ASCII strings
+                            final BytesReference data = CompressorFactory.uncompressIfNeeded(new BytesArray(bytes));
+                            result.append(new String(BytesReference.toBytes(data), StandardCharsets.ISO_8859_1));
+                        } else if (field.stringValue() != null) {
+                            result.append(field.stringValue());
+                        }
+                    }
+                }
+            }
+        }
+        return result.toString();
     }
 
     /**

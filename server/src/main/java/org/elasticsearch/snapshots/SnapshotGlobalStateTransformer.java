@@ -11,7 +11,6 @@ package org.elasticsearch.snapshots;
 
 import org.elasticsearch.cluster.metadata.Metadata;
 import org.elasticsearch.cluster.metadata.ProjectId;
-import org.elasticsearch.common.bytes.BytesReference;
 import org.elasticsearch.common.settings.SecureString;
 import org.elasticsearch.core.Nullable;
 
@@ -24,22 +23,13 @@ public interface SnapshotGlobalStateTransformer {
     SnapshotGlobalStateTransformer NOOP = new SnapshotGlobalStateTransformer() {};
 
     /**
-     * Derives key material from a snapshot {@code password} and seals it so that it can be stored in cluster state and later passed to
-     * {@link #transformForSnapshot} by whichever node is master at finalization. May be expensive; must not be called on a transport
-     * thread.
-     */
-    default BytesReference sealKey(ProjectId projectId, SecureString password) {
-        throw new IllegalArgumentException("[encrypted_data] is not supported by this cluster");
-    }
-
-    /**
      * Called on the SNAPSHOT thread pool during finalization, before the global-metadata blob is written.
      *
-     * @param sealedKey the output of {@link #sealKey} for this snapshot, or {@code null} if no {@code encrypted_data} was requested, in
-     *                  which case encrypted data must be excluded
+     * @param password the {@code encrypted_data} password for this snapshot, or {@code null} if none was requested, in which case
+     *                 encrypted data must be excluded
      * @return the metadata to write, or the same instance if unchanged
      */
-    default Metadata transformForSnapshot(ProjectId projectId, Metadata metadata, @Nullable BytesReference sealedKey) {
+    default Metadata transformForSnapshot(ProjectId projectId, Metadata metadata, @Nullable SecureString password) {
         return metadata;
     }
 

@@ -18,9 +18,7 @@ import org.elasticsearch.cluster.ClusterStateTaskListener;
 import org.elasticsearch.cluster.LocalNodeMasterListener;
 import org.elasticsearch.cluster.ProjectState;
 import org.elasticsearch.cluster.SimpleBatchedExecutor;
-import org.elasticsearch.cluster.SnapshotsInProgress;
 import org.elasticsearch.cluster.metadata.Metadata;
-import org.elasticsearch.cluster.metadata.ProjectId;
 import org.elasticsearch.cluster.project.ProjectResolver;
 import org.elasticsearch.cluster.service.ClusterService;
 import org.elasticsearch.cluster.service.MasterService;
@@ -44,11 +42,9 @@ import java.security.SecureRandom;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.HashMap;
-import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
-import java.util.Objects;
 import java.util.Set;
 import java.util.TreeSet;
 import java.util.concurrent.CopyOnWriteArrayList;
@@ -260,7 +256,7 @@ class KeyRotationCoordinator implements LocalNodeMasterListener, Closeable {
         }
     }
 
-    private void advanceKeyLifecycle(ClusterState state, ProjectEncryptionKeyMetadata metadata, long now) {
+    private void advanceKeyLifecycle(ProjectEncryptionKeyMetadata metadata, long now) {
         if (metadata.isUnwrapFailed()) {
             logger.debug("project encryption key: skipping lifecycle advancement in degraded state");
             return;
@@ -274,37 +270,9 @@ class KeyRotationCoordinator implements LocalNodeMasterListener, Closeable {
             submitBeginRotation();
         }
         long retireCutoff = now - GRACE_TICKS * checkInterval.millis();
-        if (retireableKeyIds(state, projectResolver.getProjectState(state).projectId(), metadata, retireCutoff).isEmpty() == false) {
+        if (metadata.findRetireableKeyIds(retireCutoff).isEmpty() == false) {
             submitTaskIfOpen("retire-project-encryption-keys", new RetireKeysTask(retireCutoff));
         }
-    }
-
-    /**
-     * Keys that are past their retirement cutoff, excluding any that still seal the key material of an in-progress snapshot, since
-     * that snapshot could not be finalized without them.
-     */
-    private static Set<String> retireableKeyIds(
-        ClusterState state,
-        ProjectId projectId,
-        ProjectEncryptionKeyMetadata metadata,
-        long cutoffDeactivationMillis
-    ) {
-        Set<String> retireable = metadata.findRetireableKeyIds(cutoffDeactivationMillis);
-        if (retireable.isEmpty()) {
-            return retireable;
-        }
-        Set<String> inUse = SnapshotsInProgress.get(state)
-            .asStream(projectId)
-            .map(SnapshotsInProgress.Entry::encryptedDataKey)
-            .filter(Objects::nonNull)
-            .map(key -> EncryptingSnapshotGlobalStateTransformer.sealedKeyId(key.sealedKey()))
-            .collect(Collectors.toSet());
-        if (inUse.isEmpty()) {
-            return retireable;
-        }
-        Set<String> result = new HashSet<>(retireable);
-        result.removeAll(inUse);
-        return result;
     }
 
     private boolean rotationDisabled() {
@@ -349,7 +317,7 @@ class KeyRotationCoordinator implements LocalNodeMasterListener, Closeable {
             return;
         }
 
-        advanceKeyLifecycle(state, metadata, now);
+        advanceKeyLifecycle(metadata, now);
     }
 
     private boolean reEncrypt(ProjectEncryptionKeyMetadata metadata) {
@@ -728,7 +696,7 @@ class KeyRotationCoordinator implements LocalNodeMasterListener, Closeable {
             if (existing == null) {
                 return Tuple.tuple(clusterState, null);
             }
-            Set<String> retiredIds = retireableKeyIds(clusterState, projectState.projectId(), existing, cutoffDeactivationMillis);
+            Set<String> retiredIds = existing.findRetireableKeyIds(cutoffDeactivationMillis);
             if (retiredIds.isEmpty()) {
                 return Tuple.tuple(clusterState, null);
             }
