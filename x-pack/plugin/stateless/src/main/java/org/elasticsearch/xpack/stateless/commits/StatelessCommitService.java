@@ -727,7 +727,7 @@ public class StatelessCommitService extends AbstractLifecycleComponent implement
             // TODO: we can also check whether we need upload before appending to avoid creating VBCC just above the cache region size
 
             final VirtualBatchedCompoundCommit virtualBcc;
-            final boolean commitAfterRelocationStarted;
+            final StatelessCompoundCommit lastCompoundCommit;
             final Optional<IndexShardRoutingTable> shardRoutingTable = shardRoutingFinder.apply(shardId);
             // reads the timestamp field value range outside the commit state synchronized block (because this does blocking IO)
             var timestampFieldValueRange = readTimestampFieldValueRange(commitState, reference);
@@ -745,74 +745,96 @@ public class StatelessCommitService extends AbstractLifecycleComponent implement
                     return;
                 }
                 virtualBcc = commitState.appendCommit(reference, timestampFieldValueRange);
+                // Read under the lock, since the notification may be deferred until the relocation upload bound is pinned,
+                // by which time later commits may have been appended to `virtualBcc`.
+                lastCompoundCommit = virtualBcc.lastCompoundCommit();
+                assert lastCompoundCommit.generation() == generation : lastCompoundCommit + " vs generation " + generation;
+
                 virtualBcc.addNotifiedSearchNodeIds(
-                    shardRoutingTable.map(e -> e.assignedUnpromotableShards())
+                    shardRoutingTable.map(IndexShardRoutingTable::assignedUnpromotableShards)
                         .orElse(List.of())
                         .stream()
-                        .map(shardRouting -> shardRouting.currentNodeId())
+                        .map(ShardRouting::currentNodeId)
                         .toList()
                 );
-                // TODO: the commit should wait on `relocationUploadBoundListener` to close the race window between
-                // `installUploadBoundListener` and `markRelocating`.
-                commitAfterRelocationStarted = commitState.isRelocating() && reference.getGeneration() > commitState.maxGenerationToUpload;
             }
             success = true;
+
+            // Fetch these values up front for consistent relative values.
+            final long batchedCompoundCommitGeneration = virtualBcc.getPrimaryTermAndGeneration().generation();
+            final PrimaryTermAndGeneration maxUploadedBccTermAndGen = commitState.getMaxUploadedBccTermAndGen();
+            final long maxSeqNo;
+            try {
+                maxSeqNo = Long.parseLong(reference.getIndexCommit().getUserData().get(SequenceNumbers.MAX_SEQ_NO));
+            } catch (IOException e) {
+                assert false : e; // should never happen, none of the Lucene implementations throw this.
+                throw new UncheckedIOException(e);
+            }
+
+            // Any upload bound installed after this commit was created is pinned at or above its generation, since the
+            // relocation's final flush follows it. If no listener is installed, the commit can be notified right away.
+            final SubscribableListener<Long> uploadBoundListener = commitState.relocationUploadBoundListener;
 
             // todo: ES-8431 remove commitState.isInitializingNoSearch, we only need this for relocations now.
             // It's possible that a background merge is triggered by the relocation flushes, we do not want to notify
             // the search nodes about this commit since the segments in that commit can overlap with some of the segments
             // that might be created by the new primary node and can have different contents.
-            if (shardRoutingTable.isEmpty() || commitState.isInitializingNoSearch() || commitAfterRelocationStarted) {
+            if (shardRoutingTable.isEmpty() || commitState.isInitializingNoSearch()) {
                 // for initializing shards, the applied state may not yet be available in `ClusterService.state()`.
                 // however, except for peer recovery, we can safely assume no search shards.
                 commitState.notifyCommitNotificationSuccessListeners(generation);
+            } else if (uploadBoundListener == null) {
+                maybeSendNewCommitNotification(
+                    commitState,
+                    shardRoutingTable.get(),
+                    lastCompoundCommit,
+                    batchedCompoundCommitGeneration,
+                    maxUploadedBccTermAndGen,
+                    maxSeqNo,
+                    Long.MAX_VALUE
+                );
             } else {
-                // Fetch these values up front for consistent relative values: `virtualBcc` and `commitState` may be modified later in
-                // parallel with the network request handling.
-                var lastCompoundCommit = virtualBcc.lastCompoundCommit();
-                var batchedCompoundCommitGeneration = virtualBcc.getPrimaryTermAndGeneration().generation();
-                var maxUploadedBccTermAndGen = commitState.getMaxUploadedBccTermAndGen();
+                // Wait for the relocation upload bound before advertising this commit to search shards. Between
+                // installUploadBoundListener and markRelocating the bound is not yet pinned: a merge commit created in that
+                // window may end up above the generation markRelocating later pins, and would never be uploaded. Once pinned,
+                // the listener is already complete and this runs immediately.
+                uploadBoundListener.addListener(new ActionListener<>() {
+                    @Override
+                    public void onResponse(Long maxGenerationToUpload) {
+                        maybeSendNewCommitNotification(
+                            commitState,
+                            shardRoutingTable.get(),
+                            lastCompoundCommit,
+                            batchedCompoundCommitGeneration,
+                            maxUploadedBccTermAndGen,
+                            maxSeqNo,
+                            maxGenerationToUpload
+                        );
+                    }
 
-                // Non-uploaded new commit notifications should be sent after ensuring the operations are persisted. We achieve that
-                // by (conservatively) waiting for the max seqno to be persisted by the translog replicator. This ensures that any searched
-                // data is persisted in the object store, and that the search shards can safely update their global checkpoint to the value
-                // of the local checkpoint in the commit.
-                try {
-                    var maxSeqNo = Long.parseLong(reference.getIndexCommit().getUserData().get(SequenceNumbers.MAX_SEQ_NO));
-                    addGlobalCheckpointListener(
-                        commitState.addGlobalCheckpointListenerFunction,
-                        commitState.triggerTranslogReplicator,
-                        maxSeqNo,
-                        ActionListener.wrap(
-                            ignored -> commitState.sendNewCommitNotification(
+                    @Override
+                    public void onFailure(Exception e) {
+                        if (commitState.isClosed()) {
+                            // The shard closed before markRelocating. Nothing to advertise.
+                            logger.trace(
+                                () -> format("%s skipping new-commit notification for [%s]: upload bound failed", shardId, generation),
+                                e
+                            );
+                        } else {
+                            // The relocation source abandoned the handoff before markRelocating, so no bound was pinned and
+                            // uploads were never paused. Advertise the commit. Any future bound will include it.
+                            maybeSendNewCommitNotification(
+                                commitState,
                                 shardRoutingTable.get(),
                                 lastCompoundCommit,
                                 batchedCompoundCommitGeneration,
-                                maxUploadedBccTermAndGen
-                            ),
-                            ex -> {
-                                if (ex instanceof IndexShardClosedException) {
-                                    // The shard was closed while waiting for the GCP. We can safely ignore this exception.
-                                    logger.trace(
-                                        () -> "shard closed while waiting for GCP to send new commit notification for "
-                                            + lastCompoundCommit,
-                                        ex
-                                    );
-                                } else {
-                                    assert false : ex;
-                                    logger.warn(
-                                        "unexpected exception while waiting for GCP to send new commit notification for "
-                                            + lastCompoundCommit,
-                                        ex
-                                    );
-                                }
-                            }
-                        )
-                    );
-                } catch (IOException e) {
-                    assert false : e; // should never happen, none of the Lucene implementations throw this.
-                    throw new UncheckedIOException(e);
-                }
+                                maxUploadedBccTermAndGen,
+                                maxSeqNo,
+                                Long.MAX_VALUE
+                            );
+                        }
+                    }
+                });
             }
 
             if (commitState.shouldUploadVirtualBcc(virtualBcc)) {
@@ -833,6 +855,58 @@ public class StatelessCommitService extends AbstractLifecycleComponent implement
                 IOUtils.closeWhileHandlingException(reference);
             }
         }
+    }
+
+    private void maybeSendNewCommitNotification(
+        ShardCommitState commitState,
+        IndexShardRoutingTable shardRoutingTable,
+        StatelessCompoundCommit lastCompoundCommit,
+        long batchedCompoundCommitGeneration,
+        PrimaryTermAndGeneration maxUploadedBccTermAndGen,
+        long maxSeqNo,
+        long maxGenerationToUpload
+    ) {
+        final long generation = lastCompoundCommit.generation();
+        if (generation > maxGenerationToUpload) {
+            commitState.notifyCommitNotificationSuccessListeners(generation);
+            return;
+        }
+
+        // Non-uploaded new commit notifications should be sent after ensuring the operations are persisted. We achieve that
+        // by (conservatively) waiting for the max seqno to be persisted by the translog replicator. This ensures that any searched
+        // data is persisted in the object store, and that the search shards can safely update their global checkpoint to the value
+        // of the local checkpoint in the commit.
+        // TODO: the recipients come from the routing captured when the commit was created, so a search shard that recovers
+        // from an older commit after that capture misses this notification until the next one.
+        // See https://github.com/elastic/elasticsearch/issues/150492#issuecomment-5611224118
+        addGlobalCheckpointListener(
+            commitState.addGlobalCheckpointListenerFunction,
+            commitState.triggerTranslogReplicator,
+            maxSeqNo,
+            ActionListener.wrap(
+                ignored -> commitState.sendNewCommitNotification(
+                    shardRoutingTable,
+                    lastCompoundCommit,
+                    batchedCompoundCommitGeneration,
+                    maxUploadedBccTermAndGen
+                ),
+                ex -> {
+                    if (ex instanceof IndexShardClosedException) {
+                        // The shard was closed while waiting for the GCP. We can safely ignore this exception.
+                        logger.trace(
+                            () -> "shard closed while waiting for GCP to send new commit notification for " + lastCompoundCommit,
+                            ex
+                        );
+                    } else {
+                        assert false : ex;
+                        logger.warn(
+                            "unexpected exception while waiting for GCP to send new commit notification for " + lastCompoundCommit,
+                            ex
+                        );
+                    }
+                }
+            )
+        );
     }
 
     // VBCC uploads are retried indefinitely unless the shard has been closed or it has experienced too many IO errors
@@ -3253,6 +3327,8 @@ public class StatelessCommitService extends AbstractLifecycleComponent implement
             // Consider minimum pending generation also available to search, since we are in the process of uploading it and search
             // node may have seen it before we process that the upload succeeded. This is also reasonable, because only timing
             // means it is not yet considered uploaded here.
+            // TODO: exclude paused pending-upload BCCs from latestUploading.
+            // See https://github.com/elastic/elasticsearch/pull/160420#discussion_r4243167856
             Optional<VirtualBatchedCompoundCommit> latestUploading = pendingUploadBccGenerations.values()
                 .stream()
                 .min(Comparator.comparing(PendingUploadVirtualBatchCompoundCommit::getPrimaryTermAndGeneration))
@@ -3266,8 +3342,14 @@ public class StatelessCommitService extends AbstractLifecycleComponent implement
                 .filter(bcc -> compoundCommitGeneration.onOrAfter(bcc.lastCompoundCommit().primaryTermAndGeneration()))
                 .orElse(latestUploaded);
 
-            // TODO: assert pauseUpload(availableBcc.lastCompoundCommit().primaryTermAndGeneration().generation()) == false
-            // once the commit notification upload bound race is fixed (see StatelessCommitService#onCommitCreation)
+            assert pauseUpload(availableBcc.lastCompoundCommit().primaryTermAndGeneration().generation()) == false
+                : "last compound commit ["
+                    + availableBcc.lastCompoundCommit().primaryTermAndGeneration().generation()
+                    + "] of available bcc ["
+                    + availableBcc.primaryTermAndGeneration().generation()
+                    + "] from unpromotable recovery cannot be higher than maxGenerationToUpload ["
+                    + maxGenerationToUpload
+                    + "]";
 
             var availableCommit = availableBcc.lastCompoundCommit();
             if (compoundCommitGeneration.after(availableCommit.primaryTermAndGeneration())) {
