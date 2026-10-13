@@ -184,7 +184,7 @@ public abstract class FieldMapper extends Mapper {
             throw new IllegalArgumentException(
                 "[doc_values.updatable] requires [index:false] on field ["
                     + field
-                    + "]; Lucene can only update fields that are indexed with doc values only"
+                    + "]: only fields stored purely as doc values can be updated in place"
             );
         }
         if (hasSkipper) {
@@ -198,7 +198,7 @@ public abstract class FieldMapper extends Mapper {
             throw new IllegalArgumentException(
                 "[doc_values.updatable] requires [doc_values.multi_value:false] on field ["
                     + field
-                    + "]: Lucene can only replace a single doc values value per document, so multi-valued doc values cannot be updated"
+                    + "]: only single-valued fields can be updated in place"
             );
         }
         var sortConfig = indexSettings.getIndexSortConfig();
