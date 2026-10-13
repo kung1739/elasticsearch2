@@ -52,6 +52,7 @@ import org.elasticsearch.common.blobstore.BlobContainer;
 import org.elasticsearch.common.blobstore.BlobStore;
 import org.elasticsearch.common.breaker.CircuitBreaker;
 import org.elasticsearch.common.breaker.NoopCircuitBreaker;
+import org.elasticsearch.common.component.LifecycleListener;
 import org.elasticsearch.common.io.stream.NamedWriteableRegistry;
 import org.elasticsearch.common.lucene.Lucene;
 import org.elasticsearch.common.settings.ClusterSettings;
@@ -98,6 +99,7 @@ import org.elasticsearch.indices.recovery.RecoveryGateMonitor;
 import org.elasticsearch.indices.recovery.RecoverySettings;
 import org.elasticsearch.indices.recovery.StatelessPrimaryRelocationAction;
 import org.elasticsearch.indices.recovery.StatelessUnpromotableRelocationAction;
+import org.elasticsearch.indices.recovery.UploadConcurrencyService;
 import org.elasticsearch.license.License;
 import org.elasticsearch.license.LicensedFeature;
 import org.elasticsearch.license.XPackLicenseState;
@@ -238,8 +240,10 @@ import org.elasticsearch.xpack.stateless.reshard.TransportReshardAction;
 import org.elasticsearch.xpack.stateless.reshard.TransportReshardSplitAction;
 import org.elasticsearch.xpack.stateless.reshard.TransportUpdateSplitSourceShardStateAction;
 import org.elasticsearch.xpack.stateless.reshard.TransportUpdateSplitTargetShardStateAction;
+import org.elasticsearch.xpack.stateless.snapshots.SnapshotBacklogTracker;
 import org.elasticsearch.xpack.stateless.snapshots.SnapshotsCommitService;
 import org.elasticsearch.xpack.stateless.snapshots.StatelessSnapshotSettings;
+import org.elasticsearch.xpack.stateless.snapshots.TransportGetShardGenerationsAction;
 import org.elasticsearch.xpack.stateless.snapshots.TransportGetShardSnapshotCommitInfoAction;
 import org.elasticsearch.xpack.stateless.utils.SearchShardSizeCollector;
 import org.elasticsearch.xpack.stateless.utils.SearchShardSizeCollectorProvider;
@@ -507,7 +511,9 @@ public class StatelessPlugin extends Plugin
                 TimeValue.timeValueMinutes(5),
                 true,
                 BLOB_COPY_THREAD_POOL_SETTING
-            ), };
+            ),
+            // for the upload concurrency of shard snapshots, which only stateless nodes adapt
+            ThreadPool.snapshotUploadExecutorBuilder(settings) };
     }
 
     private final SetOnce<SplitTargetService> splitTargetService = new SetOnce<>();
@@ -552,6 +558,7 @@ public class StatelessPlugin extends Plugin
     private final SetOnce<PITRelocationService> pitRelocationService = new SetOnce<>();
     private final SetOnce<List<StatelessExtensionProvider>> statelessServicesConsumerProviders = new SetOnce<>();
     private final SetOnce<SnapshotsCommitService> snapshotsCommitServiceRef = new SetOnce<>();
+    private final SetOnce<SnapshotBacklogTracker> snapshotBacklogTrackerRef = new SetOnce<>(); // only set on index nodes
     private final SetOnce<StatelessMemoryMetricsService> statelessMemoryMetricsService = new SetOnce<>();
     private final SetOnce<ShardsMappingSizeCollector> shardsMappingSizeCollector = new SetOnce<>();
     private final SetOnce<EstimatedHeapUsageRecoveryGate> estimatedHeapUsageRecoveryGate = new SetOnce<>();
@@ -596,6 +603,14 @@ public class StatelessPlugin extends Plugin
 
     public SnapshotsCommitService getSnapshotsCommitService() {
         return Objects.requireNonNull(this.snapshotsCommitServiceRef.get());
+    }
+
+    /**
+     * @return the tracker of the snapshot backlog, or {@code null} if this is not an index node
+     */
+    @Nullable
+    public SnapshotBacklogTracker getSnapshotBacklogTracker() {
+        return this.snapshotBacklogTrackerRef.get();
     }
 
     public Client getClient() {
@@ -713,7 +728,8 @@ public class StatelessPlugin extends Plugin
                 TransportPublishIndexingOperationsHeapMemoryRequirements.class
             ),
             new ActionHandler(TransportPublishMergeMemoryEstimate.INSTANCE, TransportPublishMergeMemoryEstimate.class),
-            new ActionHandler(TransportGetShardSnapshotCommitInfoAction.TYPE, TransportGetShardSnapshotCommitInfoAction.class)
+            new ActionHandler(TransportGetShardSnapshotCommitInfoAction.TYPE, TransportGetShardSnapshotCommitInfoAction.class),
+            new ActionHandler(TransportGetShardGenerationsAction.TYPE, TransportGetShardGenerationsAction.class)
         );
     }
 
@@ -914,6 +930,31 @@ public class StatelessPlugin extends Plugin
         );
         clusterService.addListener(snapshotsCommitService);
         components.add(snapshotsCommitService);
+
+        if (hasIndexRole) {
+            final var snapshotBacklogTracker = new SnapshotBacklogTracker(
+                clusterService,
+                client,
+                indicesService,
+                services.repositoriesService(),
+                threadPool,
+                meterRegistry
+            );
+            clusterService.addListener(snapshotBacklogTracker);
+            clusterService.addLifecycleListener(new LifecycleListener() {
+                @Override
+                public void afterStart() {
+                    snapshotBacklogTracker.start();
+                }
+
+                @Override
+                public void beforeStop() {
+                    snapshotBacklogTracker.stop();
+                }
+            });
+            this.snapshotBacklogTrackerRef.set(snapshotBacklogTracker);
+            components.add(snapshotBacklogTracker);
+        }
 
         var closedShardService = new ClosedShardService();
         components.add(closedShardService);
@@ -1169,6 +1210,10 @@ public class StatelessPlugin extends Plugin
                     memoryMetricsService,
                     objectStoreService
                 );
+                final var snapshotBacklogTracker = snapshotBacklogTrackerRef.get();
+                if (snapshotBacklogTracker != null) {
+                    provider.onSnapshotBacklogTrackerCreated(snapshotBacklogTracker);
+                }
             }
         }
 
@@ -1394,6 +1439,8 @@ public class StatelessPlugin extends Plugin
             STATELESS_ENABLED,
             DATA_STREAMS_LIFECYCLE_ONLY_MODE,
             FAILURE_STORE_REFRESH_INTERVAL_SETTING,
+            UploadConcurrencyService.ADAPTIVE_UPLOAD_CONCURRENCY_ENABLED_SETTING,
+            UploadConcurrencyService.UPLOAD_CONCURRENCY_MAX_SETTING,
             ObjectStoreService.TYPE_SETTING,
             ObjectStoreService.BUCKET_SETTING,
             ObjectStoreService.CLIENT_SETTING,
@@ -1517,6 +1564,8 @@ public class StatelessPlugin extends Plugin
             ScalingExecutorBuilder.HOT_THREADS_ON_LARGE_QUEUE_DURATION_THRESHOLD_SETTING,
             ScalingExecutorBuilder.HOT_THREADS_ON_LARGE_QUEUE_INTERVAL_SETTING,
             SearchShardInformationIndexListener.QUERY_SEARCH_SHARD_INFORMATION_SETTING,
+            SnapshotBacklogTracker.BACKLOG_TRACKING_ENABLED_SETTING,
+            SnapshotBacklogTracker.EVALUATION_INTERVAL_SETTING,
             StatelessSnapshotSettings.STATELESS_SNAPSHOT_ENABLED_SETTING,
             StatelessSnapshotSettings.RELOCATION_DURING_SNAPSHOT_ENABLED_SETTING,
             StatelessSnapshotSettings.STATELESS_SNAPSHOT_WAIT_FOR_ACTIVE_PRIMARY_TIMEOUT_SETTING,
