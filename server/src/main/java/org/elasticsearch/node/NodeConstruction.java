@@ -247,6 +247,7 @@ import org.elasticsearch.snapshots.IndexMetadataRestoreTransformer.NoOpRestoreTr
 import org.elasticsearch.snapshots.InternalSnapshotsInfoService;
 import org.elasticsearch.snapshots.RepositoryIntegrityHealthIndicatorService;
 import org.elasticsearch.snapshots.RestoreService;
+import org.elasticsearch.snapshots.SnapshotGlobalStateTransformer;
 import org.elasticsearch.snapshots.SnapshotShardsService;
 import org.elasticsearch.snapshots.SnapshotsInfoService;
 import org.elasticsearch.snapshots.SnapshotsService;
@@ -282,6 +283,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.IdentityHashMap;
+import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
@@ -1262,6 +1264,20 @@ class NodeConstruction {
             systemIndices,
             projectResolver.supportsMultipleProjects(),
             snapshotMetrics
+        );
+
+        // Plugins extending the provider's plugin (e.g. esql extends encryption) also see it via their parent classloader; dedupe by class
+        final var snapshotGlobalStateTransformers = pluginsService.loadServiceProviders(SnapshotGlobalStateTransformer.class)
+            .stream()
+            .collect(Collectors.toMap(Object::getClass, Function.identity(), (a, b) -> a, LinkedHashMap::new))
+            .values();
+        if (snapshotGlobalStateTransformers.size() > 1) {
+            throw new IllegalStateException("More than one extension found for " + SnapshotGlobalStateTransformer.class.getSimpleName());
+        }
+        snapshotsService.setSnapshotGlobalStateTransformer(
+            snapshotGlobalStateTransformers.isEmpty()
+                ? SnapshotGlobalStateTransformer.NOOP
+                : snapshotGlobalStateTransformers.iterator().next()
         );
 
         SnapshotShardsService snapshotShardsService = new SnapshotShardsService(

@@ -36,6 +36,7 @@ import org.elasticsearch.test.ESTestCase;
 import org.elasticsearch.threadpool.ThreadPool;
 import org.elasticsearch.xcontent.ToXContent;
 import org.elasticsearch.xpack.encryption.ProjectEncryptionKeyMetadata.KeyEntry;
+import org.elasticsearch.xpack.encryption.spi.EncryptedData;
 import org.elasticsearch.xpack.encryption.spi.EncryptedDataHandler;
 import org.elasticsearch.xpack.encryption.spi.EncryptionService;
 import org.mockito.ArgumentCaptor;
@@ -533,7 +534,7 @@ public class KeyRotationCoordinatorTests extends ESTestCase {
             }
 
             @Override
-            public TestCustom reEncrypt(TestCustom current, EncryptionService svc, String activeKeyId) {
+            public TestCustom reEncrypt(TestCustom current, java.util.function.UnaryOperator<EncryptedData> rewrapper) {
                 calls.incrementAndGet();
                 return current;
             }
@@ -573,7 +574,7 @@ public class KeyRotationCoordinatorTests extends ESTestCase {
             }
 
             @Override
-            public TestCustom reEncrypt(TestCustom current, EncryptionService svc, String activeKeyId) {
+            public TestCustom reEncrypt(TestCustom current, java.util.function.UnaryOperator<EncryptedData> rewrapper) {
                 calls.incrementAndGet();
                 return null;
             }
@@ -647,6 +648,30 @@ public class KeyRotationCoordinatorTests extends ESTestCase {
             NO_OP_ENCRYPTION
         );
         setup(clusterStateWith(metadata, true), now, TimeValue.timeValueDays(30), checkInterval);
+
+        coordinator.tick();
+
+        verify(taskQueue, never()).submitTask(
+            eq("retire-project-encryption-keys"),
+            isA(KeyRotationCoordinator.RetireKeysTask.class),
+            any()
+        );
+    }
+
+    public void testTickDoesNotSubmitRetireForKeySealingInProgressSnapshot() throws IOException {
+        TimeValue checkInterval = TimeValue.timeValueMinutes(1);
+        long now = 1_000_000L;
+        long activeGeneratedAt = now - 15 * 60 * 1000L;
+        long oldGeneratedAt = now - 30 * 60 * 1000L;
+        ProjectEncryptionKeyMetadata metadata = new ProjectEncryptionKeyMetadata(
+            Map.of("old", entry(oldGeneratedAt), "active", entry(activeGeneratedAt)),
+            "active",
+            PASSWORD_ID,
+            Map.of(),
+            NO_OP_ENCRYPTION
+        );
+        ClusterState state = KeyRotationExecutorTests.withSnapshotSealedUnder(clusterStateWith(metadata, true), "old");
+        setup(state, now, TimeValue.timeValueDays(30), checkInterval);
 
         coordinator.tick();
 
@@ -762,9 +787,9 @@ public class KeyRotationCoordinatorTests extends ESTestCase {
             }
 
             @Override
-            public TestCustom reEncrypt(TestCustom current, EncryptionService svc, String activeKeyId) {
+            public TestCustom reEncrypt(TestCustom current, java.util.function.UnaryOperator<EncryptedData> rewrapper) {
                 calls.incrementAndGet();
-                return TestCustom.encryptedUnder(activeKeyId);
+                return TestCustom.encryptedUnder(expectedKeyId);
             }
         };
     }

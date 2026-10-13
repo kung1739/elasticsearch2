@@ -40,6 +40,8 @@ import org.elasticsearch.repositories.ShardGeneration;
 import org.elasticsearch.repositories.ShardSnapshotResult;
 import org.elasticsearch.snapshots.InFlightShardSnapshotStates;
 import org.elasticsearch.snapshots.Snapshot;
+import org.elasticsearch.snapshots.SnapshotEncryptedData;
+import org.elasticsearch.snapshots.SnapshotEncryptedDataKey;
 import org.elasticsearch.snapshots.SnapshotFeatureInfo;
 import org.elasticsearch.snapshots.SnapshotId;
 import org.elasticsearch.xcontent.ToXContent;
@@ -426,6 +428,36 @@ public class SnapshotsInProgress extends AbstractNamedDiffable<Custom> implement
         IndexVersion version,
         List<SnapshotFeatureInfo> featureStates
     ) {
+        return startedEntry(
+            snapshot,
+            includeGlobalState,
+            partial,
+            indices,
+            dataStreams,
+            startTime,
+            repositoryStateId,
+            shards,
+            userMetadata,
+            version,
+            featureStates,
+            null
+        );
+    }
+
+    public static Entry startedEntry(
+        Snapshot snapshot,
+        boolean includeGlobalState,
+        boolean partial,
+        Map<String, IndexId> indices,
+        List<String> dataStreams,
+        long startTime,
+        long repositoryStateId,
+        Map<ShardId, ShardSnapshotStatus> shards,
+        Map<String, Object> userMetadata,
+        IndexVersion version,
+        List<SnapshotFeatureInfo> featureStates,
+        @Nullable SnapshotEncryptedDataKey encryptedDataKey
+    ) {
         return Entry.snapshot(
             snapshot,
             includeGlobalState,
@@ -439,7 +471,8 @@ public class SnapshotsInProgress extends AbstractNamedDiffable<Custom> implement
             shards,
             null,
             userMetadata,
-            version
+            version,
+            encryptedDataKey
         );
     }
 
@@ -902,6 +935,8 @@ public class SnapshotsInProgress extends AbstractNamedDiffable<Custom> implement
         private final Map<String, Object> userMetadata;
         @Nullable
         private final String failure;
+        @Nullable
+        private final SnapshotEncryptedDataKey encryptedDataKey;
 
         /**
          * Flag set to true in case any of the shard snapshots in {@link #shards} are
@@ -939,6 +974,41 @@ public class SnapshotsInProgress extends AbstractNamedDiffable<Custom> implement
             Map<String, Object> userMetadata,
             IndexVersion version
         ) {
+            return snapshot(
+                snapshot,
+                includeGlobalState,
+                partial,
+                state,
+                indices,
+                dataStreams,
+                featureStates,
+                startTime,
+                repositoryStateId,
+                shards,
+                failure,
+                userMetadata,
+                version,
+                null
+            );
+        }
+
+        // visible for testing, use #startedEntry and copy constructors in production code
+        public static Entry snapshot(
+            Snapshot snapshot,
+            boolean includeGlobalState,
+            boolean partial,
+            State state,
+            Map<String, IndexId> indices,
+            List<String> dataStreams,
+            List<SnapshotFeatureInfo> featureStates,
+            long startTime,
+            long repositoryStateId,
+            Map<ShardId, ShardSnapshotStatus> shards,
+            String failure,
+            Map<String, Object> userMetadata,
+            IndexVersion version,
+            @Nullable SnapshotEncryptedDataKey encryptedDataKey
+        ) {
             final Map<String, Index> res = Maps.newMapWithExpectedSize(indices.size());
             final Map<RepositoryShardId, ShardSnapshotStatus> byRepoShardIdBuilder = Maps.newHashMapWithExpectedSize(shards.size());
             boolean hasActiveShards = false;
@@ -975,7 +1045,8 @@ public class SnapshotsInProgress extends AbstractNamedDiffable<Custom> implement
                 res,
                 hasActiveShards,
                 hasInitStateShards,
-                hasWaitingStateShards
+                hasWaitingStateShards,
+                encryptedDataKey
             );
         }
 
@@ -1009,7 +1080,8 @@ public class SnapshotsInProgress extends AbstractNamedDiffable<Custom> implement
                 Map.of(),
                 false,
                 false,
-                false
+                false,
+                null
             );
         }
 
@@ -1032,7 +1104,8 @@ public class SnapshotsInProgress extends AbstractNamedDiffable<Custom> implement
             Map<String, Index> snapshotIndices,
             boolean hasActiveShards,
             boolean hasShardsInInitState,
-            boolean hasShardsInWaitingState
+            boolean hasShardsInWaitingState,
+            @Nullable SnapshotEncryptedDataKey encryptedDataKey
         ) {
             this.state = state;
             this.snapshot = snapshot;
@@ -1053,6 +1126,7 @@ public class SnapshotsInProgress extends AbstractNamedDiffable<Custom> implement
             this.hasActiveShards = hasActiveShards;
             this.hasShardsInInitState = hasShardsInInitState;
             this.hasShardsInWaitingState = hasShardsInWaitingState;
+            this.encryptedDataKey = encryptedDataKey;
             assert assertShardsConsistent(
                 this.source,
                 this.state,
@@ -1084,6 +1158,9 @@ public class SnapshotsInProgress extends AbstractNamedDiffable<Custom> implement
                 ShardSnapshotStatus::readFrom
             );
             final List<SnapshotFeatureInfo> featureStates = in.readCollectionAsImmutableList(SnapshotFeatureInfo::new);
+            final SnapshotEncryptedDataKey encryptedDataKey = in.getTransportVersion().supports(SnapshotEncryptedData.TRANSPORT_VERSION)
+                ? in.readOptionalWriteable(SnapshotEncryptedDataKey::new)
+                : null;
             if (source == null) {
                 return snapshot(
                     snapshot,
@@ -1098,7 +1175,8 @@ public class SnapshotsInProgress extends AbstractNamedDiffable<Custom> implement
                     shards,
                     failure,
                     userMetadata,
-                    version
+                    version,
+                    encryptedDataKey
                 );
             }
             assert shards.isEmpty();
@@ -1190,7 +1268,8 @@ public class SnapshotsInProgress extends AbstractNamedDiffable<Custom> implement
                 snapshotIndices,
                 hasActiveShards,
                 hasShardsInInitState,
-                hasShardsInWaitingState
+                hasShardsInWaitingState,
+                encryptedDataKey
             );
         }
 
@@ -1236,7 +1315,8 @@ public class SnapshotsInProgress extends AbstractNamedDiffable<Custom> implement
                     shards,
                     failure,
                     userMetadata,
-                    version
+                    version,
+                    encryptedDataKey
                 );
             }
             return this;
@@ -1305,7 +1385,8 @@ public class SnapshotsInProgress extends AbstractNamedDiffable<Custom> implement
                 Map.copyOf(shardsBuilder),
                 ABORTED_FAILURE_TEXT,
                 userMetadata,
-                version
+                version,
+                encryptedDataKey
             );
         }
 
@@ -1363,7 +1444,8 @@ public class SnapshotsInProgress extends AbstractNamedDiffable<Custom> implement
                     shards,
                     failure,
                     userMetadata,
-                    version
+                    version,
+                    encryptedDataKey
                 );
             }
             return withStartedShards(shards);
@@ -1387,7 +1469,8 @@ public class SnapshotsInProgress extends AbstractNamedDiffable<Custom> implement
                 shards,
                 failure,
                 userMetadata,
-                version
+                version,
+                encryptedDataKey
             );
             assert updated.state().completed() == false && completed(updated.shardSnapshotStatusByRepoShardId().values()) == false
                 : "Only running snapshots allowed but saw [" + updated + "]";
@@ -1511,6 +1594,11 @@ public class SnapshotsInProgress extends AbstractNamedDiffable<Custom> implement
             return source != null;
         }
 
+        @Nullable
+        public SnapshotEncryptedDataKey encryptedDataKey() {
+            return encryptedDataKey;
+        }
+
         @Override
         public boolean equals(Object o) {
             if (this == o) return true;
@@ -1533,6 +1621,7 @@ public class SnapshotsInProgress extends AbstractNamedDiffable<Custom> implement
             if (Objects.equals(source, ((Entry) o).source) == false) return false;
             if (shardStatusByRepoShardId.equals(((Entry) o).shardStatusByRepoShardId) == false) return false;
             if (featureStates.equals(entry.featureStates) == false) return false;
+            if (Objects.equals(encryptedDataKey, entry.encryptedDataKey) == false) return false;
 
             return true;
         }
@@ -1554,6 +1643,7 @@ public class SnapshotsInProgress extends AbstractNamedDiffable<Custom> implement
             result = 31 * result + (source == null ? 0 : source.hashCode());
             result = 31 * result + shardStatusByRepoShardId.hashCode();
             result = 31 * result + featureStates.hashCode();
+            result = 31 * result + Objects.hashCode(encryptedDataKey);
             return result;
         }
 
@@ -1658,6 +1748,9 @@ public class SnapshotsInProgress extends AbstractNamedDiffable<Custom> implement
                 out.writeMap(shardStatusByRepoShardId);
             }
             out.writeCollection(featureStates);
+            if (out.getTransportVersion().supports(SnapshotEncryptedData.TRANSPORT_VERSION)) {
+                out.writeOptionalWriteable(encryptedDataKey);
+            }
         }
 
         @Override
@@ -1826,6 +1919,9 @@ public class SnapshotsInProgress extends AbstractNamedDiffable<Custom> implement
             if (before.version().equals(after.version()) == false) {
                 throw new IllegalArgumentException("version changed from " + before.version() + " to " + after.version());
             }
+            if (Objects.equals(before.encryptedDataKey(), after.encryptedDataKey()) == false) {
+                throw new IllegalArgumentException("encrypted data key changed");
+            }
         }
 
         @Override
@@ -1853,7 +1949,8 @@ public class SnapshotsInProgress extends AbstractNamedDiffable<Custom> implement
                     part.snapshotIndices,
                     part.hasActiveShards,
                     part.hasShardsInInitState,
-                    part.hasShardsInWaitingState
+                    part.hasShardsInWaitingState,
+                    part.encryptedDataKey
                 );
             }
             if (part.isClone()) {
@@ -1882,7 +1979,8 @@ public class SnapshotsInProgress extends AbstractNamedDiffable<Custom> implement
                 updatedStateByShard,
                 updatedFailure,
                 part.userMetadata,
-                part.version
+                part.version,
+                part.encryptedDataKey
             );
         }
 
