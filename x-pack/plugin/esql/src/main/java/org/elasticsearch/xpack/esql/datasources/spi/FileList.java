@@ -153,24 +153,49 @@ public interface FileList {
     long estimatedBytes();
 
     /**
+     * {@link #globMatchCount()} where the listing cannot say how many files the glob selected — either it was
+     * built without draining the pattern at all (an enumerable-keys probe, a partition walk, a schema-inference
+     * anchor, a comma list), or the drain that built it deliberately skipped a narrowing that another query's
+     * drain will apply, so its count is not the number that would stop that drain.
+     */
+    int UNKNOWN_GLOB_MATCH_COUNT = -1;
+
+    /**
+     * How many files the glob selected, before anything narrowed the result further — or
+     * {@link #UNKNOWN_GLOB_MATCH_COUNT} where this listing has no such number to offer, whatever the bound was.
+     * <p>
+     * This is the number a listing bound is measured against, and it is not {@link #fileCount()}. The drain counts
+     * a file here when the glob matches its path, and then several things can drop it before it reaches the
+     * result: a partition-value filter, a closed-range or non-integral-equality hint, and a {@code _file.*}
+     * metadata hint. So a listing can report two files and still have stopped on a bound of three.
+     * <p>
+     * It exists because a reader cannot otherwise tell whether a listing stopped early. Asking
+     * {@code fileCount() < bound} compares a post-narrowing count against a pre-narrowing budget, which coincide
+     * only when nothing narrowed — and every rule written to detect "nothing narrowed" from the side has been a
+     * proxy that missed a case. A consumer that needs to know whether its own listing would have completed
+     * compares this.
+     */
+    default int globMatchCount() {
+        return UNKNOWN_GLOB_MATCH_COUNT;
+    }
+
+    /**
      * Whether listing stopped at a caller-supplied bound rather than reaching the end of the glob, so this
      * list is a prefix of the files the pattern (and any partition filters) matches and {@link #fileCount()} is
      * a floor, not a total.
      * <p>
-     * Only resolution ever asks for a bound. Under inferred {@code first_file_wins} and a declared mapping
-     * that prefix is of the files this query's filters keep, large enough for one file to define the schema
-     * (or, for a declaration, to count files and derive partition columns). Turning a truncated listing into
-     * the query's own file set is split discovery's job
-     * ({@code FileSplitProvider#overTheQuerysFileSet}), and everything resolution derived per file from the bounded
-     * listing — partition values, per-file read schemas — moves with the file set when it does
-     * ({@code SplitDiscoveryContext#withScanFileSet}).
+     * Resolution asks for a bound under inferred {@code first_file_wins} and a declared mapping, where that prefix
+     * is of the files this query's filters keep, large enough for one file to define the schema (or, for a
+     * declaration, to count files and derive partition columns). Split discovery asks for one too, as a first
+     * attempt it abandons when the prefix turns out not to cover the query. Turning a truncated listing into the
+     * query's own file set is split discovery's job ({@code FileSplitProvider#overTheQuerysFileSet}), and everything
+     * resolution derived per file from the bounded listing — partition values, per-file read schemas — moves with
+     * the file set when it does ({@code SplitDiscoveryContext#withScanFileSet}).
      * <p>
-     * One invariant is absolute, and nothing downstream catches its breach: a truncated list is never written to the
-     * shared listing cache, where a later query would find it and read a fraction of the dataset while believing
-     * it read all of it. That is {@code ExternalSourceResolver#listingExtentsFor}'s to keep — the cache itself
-     * does not check, the expander honours whatever extents it is handed, and omitting the fingerprint and
-     * refusing to compact do not prevent caching. A new call site asking for a bound must establish it for
-     * itself. A correctness invariant, not an optimisation.
+     * One invariant is absolute: a truncated list is never written to the shared listing cache, where a later query
+     * would find it and read a fraction of the dataset while believing it read all of it. One predicate holds it,
+     * on the way into the store — {@code ExternalSourceCacheService#refuseTruncated} — so a new call site asking for
+     * a bound inherits it rather than having to establish it. A correctness invariant, not an optimisation.
      */
     default boolean isTruncated() {
         return false;

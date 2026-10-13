@@ -5000,6 +5000,237 @@ public class GlobExpanderTests extends ESTestCase {
     }
 
     /**
+     * A bounded listing records the number of files the glob selected, not the number it returned.
+     * <p>
+     * Those differ whenever something narrows the result after the drain has counted toward its bound — a
+     * partition-value filter, a closed-range narrowing, or a {@code _file.*} metadata hint. The gap is what a
+     * cache reader needs: it decides whether a query running this bound would have completed or stopped short,
+     * and {@code fileCount()} cannot answer because it is measured on the far side of the narrowing. Every rule
+     * written to detect "nothing narrowed" from the outside missed one of the three, which is why the number is
+     * carried rather than inferred.
+     * <p>
+     * Here a {@code _file.size} hint drops two of the four files the glob matched, with a bound of three. The
+     * returned count is two, below the bound; the count that stopped the drain is three, at it.
+     */
+    public void testABoundedListingRecordsWhatTheGlobSelectedNotWhatItReturned() throws Exception {
+        List<StorageEntry> entries = List.of(
+            entry("s3://bucket/data/m=1/part.csv", 100),
+            entry("s3://bucket/data/m=2/part.csv", 1),
+            entry("s3://bucket/data/m=3/part.csv", 1),
+            entry("s3://bucket/data/m=abc/part.csv", 100)
+        );
+        TreeStubProvider provider = new TreeStubProvider(entries);
+        var sizeHint = new PartitionFilterHintExtractor.PartitionFilterHint(
+            "_file.size",
+            PartitionFilterHintExtractor.Operator.GREATER_THAN_OR_EQUAL,
+            List.of(100L)
+        );
+
+        FileList bounded = expandSync(
+            "s3://bucket/data/m=*/part.csv",
+            provider,
+            List.of(sizeHint),
+            HIVE_ON,
+            Integer.MAX_VALUE,
+            Integer.MAX_VALUE,
+            Integer.MAX_VALUE,
+            3,
+            1,
+            () -> false
+        );
+
+        // The gap is the point, and it is what no consumer can recover from the result alone: the drain stopped on
+        // its bound of three glob matches, and the hint then dropped some of those, so the count that comes out is
+        // strictly smaller than the count that stopped it. A reader comparing fileCount() to the bound would read
+        // this listing as having completed.
+        assertEquals("the bound is what stopped the drain", 3, bounded.globMatchCount());
+        assertTrue("so the listing is a prefix of the pattern", bounded.isTruncated());
+        assertThat(
+            "and the returned count is strictly smaller, which is why it cannot stand in for the bound",
+            bounded.fileCount(),
+            lessThan(bounded.globMatchCount())
+        );
+    }
+
+    /** An unbounded listing drains its pattern, so its recorded count is every file the glob selected. */
+    public void testAnUnboundedListingRecordsEveryGlobMatch() throws Exception {
+        TreeStubProvider provider = new TreeStubProvider(List.of(entry("s3://bucket/data/a.csv", 10), entry("s3://bucket/data/b.csv", 10)));
+
+        FileList all = expandSync(
+            "s3://bucket/data/*.csv",
+            provider,
+            null,
+            HIVE_ON,
+            Integer.MAX_VALUE,
+            Integer.MAX_VALUE,
+            Integer.MAX_VALUE,
+            Integer.MAX_VALUE,
+            1,
+            () -> false
+        );
+
+        assertEquals(2, all.fileCount());
+        assertEquals(2, all.globMatchCount());
+        assertFalse(all.isTruncated());
+    }
+
+    /**
+     * A listing the partition walk withdrew from records no glob-match count, so it can never be served to a
+     * bounded query — whose own listing of the same inputs is a strict subset of it.
+     *
+     * <p>When the walk withdraws, the pattern is re-listed flat with the value filter deliberately suppressed, so
+     * that listing is the unfiltered superset. A bounded query never walks: it applies the filter in the drain and
+     * keeps the subset. Whether the two agree turns on a difference in what the two trust checks look at — the walk
+     * types a partition column from the <em>folder names</em> it enumerated, the drain from the <em>files</em> it
+     * matched — so a {@code key=value} folder holding no matching file is visible only to the walk. Here
+     * {@code m=abc} holds a {@code _SUCCESS}, not a {@code .csv}: it widens the column to text for the walk, which
+     * withdraws, while the drain never sees it and trusts its own prune.
+     *
+     * <p>So the superset is two files and the bounded listing is one, and both drains counted two. Served, the bounded
+     * query would read a file its own filter excludes and — under {@code first_file_wins}, where the schema comes
+     * from the first path — infer its schema from a different file than it would cold. Recording no count is what
+     * stops it: the entry still serves a query that wants the whole pattern, and a bounded one re-lists.
+     */
+    public void testAWalkRejectedListingIsNotServableToABoundedQuery() throws Exception {
+        List<StorageEntry> files = List.of(
+            entry("s3://bucket/logs/k=1/m=1/a.csv", 10),
+            entry("s3://bucket/logs/k=2/m=abc/_SUCCESS", 0),
+            entry("s3://bucket/logs/k=3/m=2/c.csv", 10)
+        );
+        // The data-column conjunct keeps the walk descending to the second level, where the placeholder sits.
+        var hints = List.of(
+            hint("k", PartitionFilterHintExtractor.Operator.IN, 1, 2),
+            hint("status", PartitionFilterHintExtractor.Operator.EQUALS, "ok")
+        );
+        String glob = "s3://bucket/logs/k=*/m=*/*.csv";
+
+        FileList withdrawn = GlobExpander.expand(glob, new TreeStubProvider(files), hints, HIVE_ON, MAX, MAX);
+        FileList bounded = expandSync(
+            glob,
+            new TreeStubProvider(files),
+            hints,
+            HIVE_ON,
+            Integer.MAX_VALUE,
+            Integer.MAX_VALUE,
+            Integer.MAX_VALUE,
+            10,
+            1,
+            () -> false
+        );
+
+        assertEquals("the withdrawn walk re-lists the superset the filter would have pruned", 2, withdrawn.fileCount());
+        assertEquals("while a bounded query's own listing keeps only what its filter selects", 1, bounded.fileCount());
+        assertNotEquals("the two disagree, which is the whole reason the count must not be recorded", paths(withdrawn), paths(bounded));
+        assertEquals(
+            "so the superset records no count and cannot be served to a bounded query",
+            FileList.UNKNOWN_GLOB_MATCH_COUNT,
+            withdrawn.globMatchCount()
+        );
+        assertFalse("and it is still cacheable for a query that wants the whole pattern", withdrawn.isTruncated());
+    }
+
+    /**
+     * The fan-out must not spend a request on a folder the pattern cannot match.
+     * <p>
+     * One slot is one {@code listObjects}, and the slot list was built from every directory under the pattern
+     * prefix. Because {@code patternPrefix} cuts at the last {@code /} before the first metacharacter, a selective
+     * glob roots at the parent of every sibling partition the dataset has, so the enumeration cost was a property
+     * of the dataset rather than of the query: twelve years listed to answer about one.
+     * <p>
+     * Pinned as the exact set of prefixes, so a failure names the folders that were read.
+     */
+    public void testFanOutDoesNotListAFolderTheGlobCannotMatch() throws Exception {
+        // The wildcard sits INSIDE a segment, so patternPrefix cuts above every date folder and the slot list is
+        // built from all of them. A pattern whose own prefix is the matched folder would not discriminate: every
+        // child then satisfies the rest of it and the filter is never asked to exclude anything, so the test would
+        // pass with the filter deleted.
+        List<StorageEntry> entries = new ArrayList<>();
+        for (int d = 0; d < 1200; d++) {
+            entries.add(entry(String.format(Locale.ROOT, "s3://bucket/data/date=2023-%06d/part.parquet", d), 100));
+        }
+        for (int d = 1; d <= 9; d++) {
+            entries.add(entry(String.format(Locale.ROOT, "s3://bucket/data/date=2024-01-%02d/part.parquet", d), 100));
+        }
+        TreeStubProvider provider = new TreeStubProvider(entries);
+
+        @SuppressWarnings("RegexpMultiline")
+        String pattern = "s3://bucket/data/date=2024-01-0*/*.parquet";
+        FileList result = expandSync(
+            pattern,
+            provider,
+            null,
+            HIVE_ON,
+            Integer.MAX_VALUE,
+            Integer.MAX_VALUE,
+            Integer.MAX_VALUE,
+            Integer.MAX_VALUE,
+            4,
+            () -> false
+        );
+
+        assertEquals(9, result.fileCount());
+        // The count is the assertion: one listObjects per slot, so slots must follow the matching set. Without the
+        // filter this is 1209.
+        // The set, so a failure prints the folders that were read rather than only how many. A count would be
+        // satisfied by nine listings of one folder, and would not name the 1200 when it regressed.
+        Set<String> expected = new LinkedHashSet<>();
+        for (int d = 1; d <= 9; d++) {
+            expected.add(String.format(Locale.ROOT, "s3://bucket/data/date=2024-01-%02d/", d));
+        }
+        assertEquals(
+            "one listing per matching folder and none for the 1200 it cannot match",
+            expected,
+            Set.copyOf(provider.listedPrefixes)
+        );
+        assertEquals("and none of them listed twice", 9, provider.listedPrefixes.size());
+    }
+
+    /**
+     * A bound is not reached by keys the glob cannot match, and a listing that drained its prefix without reaching
+     * it is not truncated.
+     * <p>
+     * Both halves are the same defect seen from the two sides that matter. The count: a bound spent on non-matching
+     * keys returns fewer matches than the dataset holds, or none. The flag: {@code isTruncated()} decides whether
+     * an empty result can be believed and whether the listing may be cached, so a complete listing reporting itself
+     * as a prefix forfeits both. The fixture makes the two populations differ by construction — one matching file
+     * among eight hundred keys under the same prefix, with a bound far below the key count and far above the match
+     * count.
+     */
+    public void testABoundCountsMatchesSoAFullDrainIsNotTruncated() throws Exception {
+        List<StorageEntry> entries = new ArrayList<>();
+        for (int y = 0; y < 8; y++) {
+            for (int f = 0; f < 100; f++) {
+                entries.add(entry(String.format(Locale.ROOT, "s3://bucket/data/year=%04d/f%04d.csv", 2016 + y, f), 100));
+            }
+        }
+        entries.add(entry("s3://bucket/data/year=2024/only.parquet", 100));
+        TreeStubProvider provider = new TreeStubProvider(entries);
+
+        @SuppressWarnings("RegexpMultiline")
+        String pattern = "s3://bucket/data/**/*.parquet";
+        FileList result = expandSync(
+            pattern,
+            provider,
+            null,
+            HIVE_ON,
+            Integer.MAX_VALUE,
+            Integer.MAX_VALUE,
+            Integer.MAX_VALUE,
+            10,
+            1,
+            () -> false
+        );
+
+        assertEquals("the one matching file, found past 800 keys the bound must not have counted", 1, result.fileCount());
+        assertEquals("s3://bucket/data/year=2024/only.parquet", result.path(0).toString());
+        assertFalse("a drain that exhausted its prefix below the bound is the whole pattern, not a prefix of it", result.isTruncated());
+        // The load-bearing assertion. A bound counting keys returns empty-truncated here, and the expander then
+        // re-lists unbounded and produces the same three answers above from the retry - so without this the test
+        // passes against the defect it is named for. One pass means the first, bounded listing answered.
+        assertEquals("the bounded listing must answer, not be thrown away and retried", 1, provider.listedPrefixes.size());
+    }
+
+    /**
      * Verifies that the fan-out drains each derived prefix independently (sequentially). Each prefix issues its
      * own {@code listObjects} call; the total across all prefixes is greater than one.
      */
@@ -5282,8 +5513,14 @@ public class GlobExpanderTests extends ESTestCase {
         assertEquals("only month=07 survives, in both years", 4, result.fileCount());
     }
 
-    /** A bound that lists only litter must not decide the dataset is empty, on either path. */
-    public void testAsyncRetryAfterABoundThatListsOnlyLitterMatchesSync() throws Exception {
+    /**
+     * A bound must not be spent on litter, on either path. {@code _a.parquet} matches the glob and is then dropped
+     * by the name filter, so it is not one of the files the bound counts: the drain walks past it and stops at the
+     * first file it keeps. This used to return two files, because the one key the bound allowed was the excluded
+     * one, the page came back empty, and an empty page could not be told from an empty dataset — so the whole glob
+     * was listed again. The answer no longer depends on how much litter sits in front of the data.
+     */
+    public void testABoundIsNotSpentOnLitter() throws Exception {
         List<StorageEntry> tree = List.of(
             entry("s3://bucket/data/_a.parquet", 10),
             entry("s3://bucket/data/b/x.parquet", 10),
@@ -5293,7 +5530,10 @@ public class GlobExpanderTests extends ESTestCase {
         @SuppressWarnings("RegexpMultiline")
         String pattern = "s3://bucket/data/**/*.parquet";
         TreeStubProvider provider = assertAsyncMatchesSync(pattern, tree, null, 1);
-        assertEquals(2, expandSync(pattern, provider, null, HIVE_ON, MAX, MAX, MAX, 1, 4, () -> false).fileCount());
+        FileList result = expandSync(pattern, provider, null, HIVE_ON, MAX, MAX, MAX, 1, 4, () -> false);
+        assertEquals("the first file the bound counts, not an empty listing", 1, result.fileCount());
+        assertEquals("s3://bucket/data/b/x.parquet", result.path(0).toString());
+        assertTrue("one of the two matching files, so the listing is a prefix of the dataset", result.isTruncated());
     }
 
     /**
@@ -6543,21 +6783,26 @@ public class GlobExpanderTests extends ESTestCase {
     }
 
     /**
-     * The re-list after a bounded page matched nothing is the whole glob, so partition detection folds over all of
-     * it. Keeping the partition sample across that retry would type a column from the front of a listing that
-     * shipped every file, and leave every file past the sample with no partition values at all.
+     * The re-list after a narrowing matched nothing is the whole glob, so partition detection folds over all of it.
+     * Keeping the partition sample across that retry would type a column from the front of a listing that shipped
+     * every file, and leave every file past the sample with no partition values at all.
+     * <p>
+     * The narrowing here is the glob rewrite, which is the one that can still come back empty from a non-empty
+     * dataset: it spells {@code month == 7} as {@code month=7} and the folders are {@code month=07}, so it lists a
+     * prefix that does not exist. A bound can no longer do this — it counts matching files, so a drain that
+     * exhausted the prefix without reaching it has seen every key and its empty answer is the dataset's.
      */
-    public void testRelistAfterAnEmptyBoundedPageTypesPartitionsFromEveryFile() throws IOException {
+    public void testRelistAfterANarrowingThatMatchedNothingTypesPartitionsFromEveryFile() throws IOException {
         List<StorageEntry> listing = List.of(
-            entry("s3://bucket/data/skip.csv", 50),
-            entry("s3://bucket/data/year=2024/a.parquet", 100),
-            entry("s3://bucket/data/year=abc/b.parquet", 100)
+            entry("s3://bucket/data/year=2024/month=07/a.parquet", 100),
+            entry("s3://bucket/data/year=abc/month=07/b.parquet", 100)
         );
+        var hints = List.of(hint("month", PartitionFilterHintExtractor.Operator.EQUALS, 7));
 
         FileList result = GlobExpander.expand(
-            "s3://bucket/data/" + "**/*.parquet",
+            "s3://bucket/data/year=*/month=*/*.parquet",
             new CountingStubProvider(listing),
-            null,
+            hints,
             HIVE_ON,
             Integer.MAX_VALUE,
             Integer.MAX_VALUE,

@@ -527,8 +527,8 @@ public class FileSplitProvider implements SplitProvider {
      * already and is returned unchanged. An inference-anchor listing is a schema stash, not a scan set, so this
      * swaps in empty rather than listing again. A prefix — {@code first_file_wins}, whose schema needed one file —
      * is not complete, so this lists the dataset with the query's own filters. Continuing from the prefix rather
-     * than listing again is the obvious refinement and is not done yet: the page the schema read is listed twice,
-     * one request against the full listing's many.
+     * than listing again is the obvious refinement and is not done yet, though the shared listing cache now
+     * absorbs the repeat whenever the schema's listing covered the whole pattern.
      */
     private SplitDiscoveryContext overTheQuerysFileSet(SplitDiscoveryContext handed, ListingExtents extents) throws Exception {
         DatasetDiscovery discovery = DatasetDiscovery.shared(handed.fileList());
@@ -772,19 +772,34 @@ public class FileSplitProvider implements SplitProvider {
             );
             List<PartitionFilterHintExtractor.PartitionFilterHint> narrowing = hints.isEmpty() ? null : hints;
             if (extents.boundsFileSet()) {
-                // Never the cache: what comes back is a prefix of the dataset, and the cache's entries are answers
-                // other queries are served whole. This query may read a prefix because its own demand is covered by
-                // one; the next query's demand is not this one's.
-                return listingService.expand(
-                    pattern,
-                    provider,
-                    narrowing,
-                    config,
-                    storagePath,
-                    extents,
-                    scanMemory(context),
-                    context.isCancelled()
-                );
+                // The cache either way, because what decides is the listing that comes back rather than the bound
+                // that was asked for: a first attempt that drained its whole prefix is the dataset, and the next
+                // query is owed exactly that. One that stopped on the bound is a prefix, and the cache refuses it
+                // (DatasetListingService.boundedListing), so the attempt below still re-lists unbounded for its own
+                // query and leaves nothing behind for anyone else's.
+                return listingService.isCacheable(provider)
+                    ? listingService.boundedListing(
+                        pattern,
+                        storagePath,
+                        provider,
+                        storageIdentity,
+                        secretIdentity,
+                        narrowing,
+                        config,
+                        extents,
+                        scanMemory(context),
+                        context.isCancelled()
+                    )
+                    : listingService.expand(
+                        pattern,
+                        provider,
+                        narrowing,
+                        config,
+                        storagePath,
+                        extents,
+                        scanMemory(context),
+                        context.isCancelled()
+                    );
             }
             // The whole pattern either way, so it is cacheable: the query's file set is the dataset's, narrowed by
             // filters the cache key already distinguishes. Without this a warm second query over the same dataset
