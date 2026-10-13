@@ -29,6 +29,7 @@ import org.elasticsearch.snapshots.AbstractSnapshotIntegTestCase;
 import org.elasticsearch.snapshots.SnapshotEncryptedData;
 import org.elasticsearch.snapshots.SnapshotInfo;
 import org.elasticsearch.snapshots.SnapshotState;
+import org.elasticsearch.snapshots.SnapshotsService;
 import org.elasticsearch.test.ESIntegTestCase;
 import org.elasticsearch.xcontent.ConstructingObjectParser;
 import org.elasticsearch.xcontent.NamedXContentRegistry;
@@ -49,6 +50,7 @@ import java.util.List;
 import java.util.function.UnaryOperator;
 
 import static org.elasticsearch.xcontent.ConstructingObjectParser.constructorArg;
+import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.notNullValue;
 
@@ -122,6 +124,30 @@ public class SnapshotEncryptedDataIT extends AbstractSnapshotIntegTestCase {
 
         assertFalse(snapshotInfo.hasEncryptedData());
         assertNull(blobInSnapshot(snapshotInfo));
+    }
+
+    public void testEncryptedDataRequiredRejectsSnapshotWithoutPassword() throws Exception {
+        internalCluster().startMasterOnlyNode();
+        internalCluster().startDataOnlyNode();
+        seedEncryptedBlob(randomByteArrayOfLength(32));
+        createRepository(REPO, "fs");
+        createIndexWithContent("index");
+        updateClusterSettings(Settings.builder().put(SnapshotsService.ENCRYPTED_DATA_REQUIRED_SETTING.getKey(), true));
+
+        final IllegalArgumentException e = expectThrows(
+            IllegalArgumentException.class,
+            clusterAdmin().prepareCreateSnapshot(TEST_REQUEST_TIMEOUT, REPO, "snap").setWaitForCompletion(true)
+        );
+        assertThat(e.getMessage(), containsString("[snapshot.encrypted_data.required] is true"));
+
+        final SnapshotInfo withoutGlobalState = clusterAdmin().prepareCreateSnapshot(TEST_REQUEST_TIMEOUT, REPO, "snap-no-global-state")
+            .setIncludeGlobalState(false)
+            .setWaitForCompletion(true)
+            .get()
+            .getSnapshotInfo();
+        assertThat(withoutGlobalState.state(), equalTo(SnapshotState.SUCCESS));
+
+        updateClusterSettings(Settings.builder().putNull(SnapshotsService.ENCRYPTED_DATA_REQUIRED_SETTING.getKey()));
     }
 
     private TestBlob blobInSnapshot(SnapshotInfo snapshotInfo) {

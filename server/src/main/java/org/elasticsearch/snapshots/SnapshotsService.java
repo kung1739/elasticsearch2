@@ -286,41 +286,6 @@ public final class SnapshotsService extends AbstractLifecycleComponent implement
     }
 
     /**
-     * Runs the encrypted-data pre-flight check for a create-snapshot request. Rejects the request when
-     * {@code snapshot.encrypted_data.required} is true and no {@code encrypted_data} was supplied.
-     * Must be called from the master-operation thread, before any cluster-state task is submitted.
-     *
-     * @return {@code true} if the caller should proceed, {@code false} if the listener was already resolved with an error.
-     */
-    public boolean preflightEncryptedDataCheck(
-        ProjectId projectId,
-        CreateSnapshotRequest request,
-        Metadata metadata,
-        ActionListener<?> listener
-    ) {
-        if (SnapshotEncryptedData.FEATURE_FLAG.isEnabled() == false || request.encryptedData() != null) {
-            return true;
-        }
-        if (request.includeGlobalState() == false) {
-            return true;
-        }
-        if (snapshotGlobalStateTransformer.containsEncryptedData(projectId, metadata) == false) {
-            return true;
-        }
-        if (encryptedDataRequired) {
-            listener.onFailure(
-                new IllegalArgumentException(
-                    "Snapshot request rejected: the cluster contains encrypted project data and "
-                        + "[snapshot.encrypted_data.required] is true. "
-                        + "Supply [encrypted_data] in the request to include the data in the snapshot."
-                )
-            );
-            return false;
-        }
-        return true;
-    }
-
-    /**
      * Same as {@link #createSnapshot(ProjectId, CreateSnapshotRequest, ActionListener)} but invokes its callback on completion of
      * the snapshot.
      *
@@ -360,6 +325,18 @@ public final class SnapshotsService extends AbstractLifecycleComponent implement
         }
         if (request.encryptedData() != null && snapshotGlobalStateTransformer == SnapshotGlobalStateTransformer.NOOP) {
             listener.onFailure(new IllegalArgumentException("[encrypted_data] is not supported by this cluster"));
+            return;
+        }
+        if (request.encryptedData() == null
+            && encryptedDataRequired
+            && request.includeGlobalState()
+            && snapshotGlobalStateTransformer.containsEncryptedData(projectId, clusterService.state().metadata())) {
+            listener.onFailure(
+                new IllegalArgumentException(
+                    "the cluster contains encrypted project data and [snapshot.encrypted_data.required] is true; "
+                        + "supply [encrypted_data] to include the data in the snapshot"
+                )
+            );
             return;
         }
         submitCreateSnapshotRequest(
