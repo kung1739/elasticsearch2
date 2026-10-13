@@ -347,8 +347,59 @@ public class CsvFormatReader implements SegmentableFormatReader {
      * the original parser, preserving the existing surface contract.
      */
     static long tryParseSpaceSeparatedDatetimeMillis(String value) {
+        // Exactly three fraction digits, as before: a wider fraction keeps falling through to Stage 3, so the
+        // datetime grammar is unchanged by the nanosecond sibling below.
+        long nanoOfSecond = spaceSeparatedNanoOfSecond(value, 3);
+        if (nanoOfSecond == FAST_PATH_MISS) {
+            return FAST_PATH_MISS;
+        }
+        long seconds = spaceSeparatedEpochSecond(value);
+        if (seconds == FAST_PATH_MISS) {
+            return FAST_PATH_MISS;
+        }
+        return seconds * 1_000L + nanoOfSecond / 1_000_000L;
+    }
+
+    /**
+     * The {@code date_nanos} sibling of {@link #tryParseSpaceSeparatedDatetimeMillis}: the same
+     * {@code YYYY-MM-DD HH:MM:SS} template with up to nine fraction digits, returned as epoch nanoseconds.
+     * {@code date_nanos} exists for sub-millisecond precision, so truncating the fraction to millis here and
+     * widening afterwards would lose exactly what the declared type was chosen for.
+     * <p>
+     * Returns {@link #FAST_PATH_MISS} when the template does not match or when the instant has no nanosecond
+     * representation, in which case the caller falls through to the general parser and reports the failure.
+     */
+    static long tryParseSpaceSeparatedDatetimeNanos(String value) {
+        long nanoOfSecond = spaceSeparatedNanoOfSecond(value, 9);
+        if (nanoOfSecond == FAST_PATH_MISS) {
+            return FAST_PATH_MISS;
+        }
+        long seconds = spaceSeparatedEpochSecond(value);
+        if (seconds == FAST_PATH_MISS) {
+            return FAST_PATH_MISS;
+        }
+        try {
+            long nanos = Math.addExact(Math.multiplyExact(seconds, 1_000_000_000L), nanoOfSecond);
+            // The date_nanos domain, which this stage has to enforce itself because it returns before Stage 3's
+            // DateUtils.asNanos would. Only the floor needs a test: Long.MAX_VALUE nanoseconds IS
+            // 2262-04-11T23:47:16.854775807, the top of the domain, so the exact arithmetic above already rejects
+            // anything past it. A pre-1970 instant has no nanosecond representation, so it falls through and the
+            // general parser reports the cell rather than this stage emitting a negative nanos long.
+            return nanos < 0 ? FAST_PATH_MISS : nanos;
+        } catch (ArithmeticException e) {
+            return FAST_PATH_MISS;
+        }
+    }
+
+    /**
+     * The nanosecond-of-second a space-separated timestamp carries, scaled from however many fraction digits it
+     * has (up to {@code maxFractionDigits}), or {@link #FAST_PATH_MISS} when {@code value} does not match the
+     * {@code YYYY-MM-DD HH:MM:SS[.f..f]} template. Only the fraction is read here; the date and time fields are
+     * validated by {@link #spaceSeparatedEpochSecond}, so a caller must consult both.
+     */
+    private static long spaceSeparatedNanoOfSecond(String value, int maxFractionDigits) {
         int len = value.length();
-        if (len != 19 && len != 23) {
+        if (len < 19) {
             return FAST_PATH_MISS;
         }
         if (value.charAt(4) != '-'
@@ -358,6 +409,32 @@ public class CsvFormatReader implements SegmentableFormatReader {
             || value.charAt(16) != ':') {
             return FAST_PATH_MISS;
         }
+        if (len == 19) {
+            return 0;
+        }
+        int digits = len - 20;
+        if (value.charAt(19) != '.' || digits < 1 || digits > maxFractionDigits) {
+            return FAST_PATH_MISS;
+        }
+        int fraction = parseFixedDigits(value, 20, digits);
+        if (fraction < 0) {
+            return FAST_PATH_MISS;
+        }
+        long scaled = fraction;
+        for (int i = digits; i < 9; i++) {
+            scaled *= 10;
+        }
+        return scaled;
+    }
+
+    /**
+     * The epoch second of a space-separated timestamp's date and time fields, or {@link #FAST_PATH_MISS} when a
+     * field is not digits or the calendar rejects the date. {@code LocalDateTime.of} validates the calendar bounds
+     * (month 1..12, day-of-month per month, leap years), and trapping its exception here keeps the fast path
+     * side-effect-free: the caller falls through to the general-purpose parser, which preserves the existing
+     * {@code DateUtils.asDateTime} semantics, including the user-facing "Failed to parse" message.
+     */
+    private static long spaceSeparatedEpochSecond(String value) {
         int year = parseFixedDigits(value, 0, 4);
         int month = parseFixedDigits(value, 5, 2);
         int day = parseFixedDigits(value, 8, 2);
@@ -367,24 +444,8 @@ public class CsvFormatReader implements SegmentableFormatReader {
         if ((year | month | day | hour | minute | second) < 0) {
             return FAST_PATH_MISS;
         }
-        int millis = 0;
-        if (len == 23) {
-            if (value.charAt(19) != '.') {
-                return FAST_PATH_MISS;
-            }
-            millis = parseFixedDigits(value, 20, 3);
-            if (millis < 0) {
-                return FAST_PATH_MISS;
-            }
-        }
-        // LocalDateTime.of validates calendar bounds (month 1..12, day-of-month per month, leap
-        // years etc.). Trapping the DateTimeException here keeps the fast path side-effect-free on
-        // invalid dates: the caller falls through to the general-purpose Stage 3 parser, which
-        // preserves the existing DateUtils.asDateTime semantics (including the user-facing
-        // "Failed to parse" error message it produces for genuinely invalid inputs).
         try {
-            LocalDateTime ldt = LocalDateTime.of(year, month, day, hour, minute, second);
-            return ldt.toInstant(ZoneOffset.UTC).toEpochMilli() + millis;
+            return LocalDateTime.of(year, month, day, hour, minute, second).toEpochSecond(ZoneOffset.UTC);
         } catch (DateTimeException e) {
             return FAST_PATH_MISS;
         }
@@ -7262,7 +7323,10 @@ public class CsvFormatReader implements SegmentableFormatReader {
         }
 
         private Object tryParseDateNanos(String value, int columnIndex) {
-            // Mirrors tryParseDatetime exactly, one rail down: a column with a declared `format` parses strictly with
+            // The same five-stage ladder as tryParseDatetime, one rail down -- the stages are listed there, and the
+            // two that used to be missing here (the space-separated template and the DateUtils.asDateTime tail) are
+            // the reason a declared date_nanos refused cells a declared date read. A column with a declared `format`
+            // parses strictly with
             // that ES DateFormatter, overriding the epoch shortcut and the file-level datetime_format, for THIS column
             // only. Every rail goes through EsqlDataTypeConverter.dateNanosToLong — the SAME string -> date_nanos
             // conversion the columnar declared coercion (DeclaredTypeCoercions.scalarCoercer, which threads the
@@ -7309,11 +7373,25 @@ public class CsvFormatReader implements SegmentableFormatReader {
                 }
                 // Overflowed a long; fall through to the ISO fallback, which will report the failure.
             }
+            // Stage 2, the datetime ladder's counterpart: `YYYY-MM-DD HH:MM:SS[.f..f]`, which the ISO parser does
+            // not accept. pandas and every SQL dump write that form, and a declared date_nanos used to refuse the
+            // very cell a declared date reads. At nanosecond precision, since that is what the type is for.
+            long spaceNanos = tryParseSpaceSeparatedDatetimeNanos(value);
+            if (spaceNanos != FAST_PATH_MISS) {
+                return spaceNanos;
+            }
             try {
                 return EsqlDataTypeConverter.dateNanosToLong(value);
             } catch (IllegalArgumentException e) {
-                lastFieldError = cannotRead(value, DataType.DATE_NANOS);
-                return null;
+                // Stage 3, again mirroring the datetime ladder: the long tail the ISO parser misses -- a
+                // space-separated value carrying a zone, a lowercase `t`, an offset. asNanos applies the date_nanos
+                // range rule, so an instant outside 1970..2262 is reported as unreadable rather than wrapping.
+                try {
+                    return DateUtils.asNanos(DateUtils.asDateTime(value));
+                } catch (DateTimeParseException | IllegalArgumentException ignored) {
+                    lastFieldError = cannotRead(value, DataType.DATE_NANOS);
+                    return null;
+                }
             }
         }
 
