@@ -20,6 +20,7 @@ import org.elasticsearch.cluster.metadata.ProjectId;
 import org.elasticsearch.cluster.project.ProjectResolver;
 import org.elasticsearch.cluster.service.ClusterService;
 import org.elasticsearch.common.util.concurrent.EsExecutors;
+import org.elasticsearch.features.FeatureService;
 import org.elasticsearch.injection.guice.Inject;
 import org.elasticsearch.snapshots.SnapshotInfo;
 import org.elasticsearch.snapshots.SnapshotsService;
@@ -34,6 +35,7 @@ public class TransportCreateSnapshotAction extends TransportMasterNodeAction<Cre
     public static final ActionType<CreateSnapshotResponse> TYPE = new ActionType<>("cluster:admin/snapshot/create");
     private final SnapshotsService snapshotsService;
     private final ProjectResolver projectResolver;
+    private final FeatureService featureService;
 
     @Inject
     public TransportCreateSnapshotAction(
@@ -42,7 +44,8 @@ public class TransportCreateSnapshotAction extends TransportMasterNodeAction<Cre
         ThreadPool threadPool,
         SnapshotsService snapshotsService,
         ActionFilters actionFilters,
-        ProjectResolver projectResolver
+        ProjectResolver projectResolver,
+        FeatureService featureService
     ) {
         super(
             TYPE.name(),
@@ -56,6 +59,18 @@ public class TransportCreateSnapshotAction extends TransportMasterNodeAction<Cre
         );
         this.snapshotsService = snapshotsService;
         this.projectResolver = projectResolver;
+        this.featureService = featureService;
+    }
+
+    @Override
+    protected void doExecute(Task task, CreateSnapshotRequest request, ActionListener<CreateSnapshotResponse> listener) {
+        // checked before forwarding: an older master would silently drop the field
+        if (request.encryptedData() != null
+            && featureService.clusterHasFeature(clusterService.state(), CreateSnapshotFeatures.ENCRYPTED_DATA) == false) {
+            listener.onFailure(new IllegalArgumentException("[encrypted_data] is not supported until all nodes are upgraded"));
+            return;
+        }
+        super.doExecute(task, request, listener);
     }
 
     @Override
