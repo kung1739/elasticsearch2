@@ -122,16 +122,16 @@ public class SnapshotsInProgressSerializationTests extends SimpleDiffableWireSer
 
     public void testEncryptedDataDroppedForOlderVersions() throws IOException {
         final var oldVersion = TransportVersionUtils.getPreviousVersion(SnapshotEncryptedData.TRANSPORT_VERSION);
-        final Entry withKey = randomSnapshot(randomProjectIdOrDefault(), randomEncryptedData());
+        final Entry withEncryptedData = randomSnapshot(randomProjectIdOrDefault(), randomEncryptedData());
         final BytesStreamOutput out = new BytesStreamOutput();
         out.setTransportVersion(oldVersion);
-        SnapshotsInProgress.EMPTY.withAddedEntry(withKey).writeTo(out);
+        SnapshotsInProgress.EMPTY.withAddedEntry(withEncryptedData).writeTo(out);
 
         final var in = out.bytes().streamInput();
         in.setTransportVersion(oldVersion);
         final Entry fromStream = new SnapshotsInProgress(in).asStream().findFirst().orElseThrow();
         assertNull(fromStream.encryptedData());
-        assertThat(fromStream, equalTo(withoutEncryptedData(withKey)));
+        assertThat(fromStream, equalTo(withoutEncryptedData(withEncryptedData)));
     }
 
     private static Entry withoutEncryptedData(Entry entry) {

@@ -47,6 +47,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Function;
+import java.util.function.UnaryOperator;
 
 import static org.elasticsearch.test.hamcrest.ElasticsearchAssertions.assertAcked;
 import static org.hamcrest.Matchers.anEmptyMap;
@@ -427,7 +428,7 @@ public class KeyRotationIT extends SecurityIntegTestCase {
             EncryptedDataHandler<T> {
 
         @Override
-        public T reEncrypt(T current, java.util.function.UnaryOperator<EncryptedData> rewrapper) {
+        public T reEncrypt(T current, UnaryOperator<EncryptedData> rewrapper) {
             state.callCount.incrementAndGet();
             if (current == null) {
                 return null;

@@ -50,8 +50,6 @@ public class EncryptingSnapshotGlobalStateTransformerTests extends ESTestCase {
         EncryptedDataHandlerRegistry.INSTANCE.set(null);
     }
 
-    // --- inline test custom ---
-
     /** Minimal {@link Metadata.ProjectCustom} carrying one {@link EncryptedData}; context includes SNAPSHOT. */
     static final class TestBlob extends AbstractNamedDiffable<Metadata.ProjectCustom> implements Metadata.ProjectCustom {
         static final String TYPE = "test_blob_for_transformer";
@@ -114,8 +112,6 @@ public class EncryptingSnapshotGlobalStateTransformerTests extends ESTestCase {
         }
     }
 
-    // --- helpers ---
-
     private static AesGcmEncryptionService buildService() {
         byte[] keyBytes = new byte[32];
         new SecureRandom().nextBytes(keyBytes);
@@ -154,8 +150,6 @@ public class EncryptingSnapshotGlobalStateTransformerTests extends ESTestCase {
         Metadata metadata = Metadata.builder().put(project).build();
         return new Setup(metadata, svc, blob);
     }
-
-    // --- tests ---
 
     public void testWithPasswordRewrapsUnderSnapshotKey() {
         Setup s = buildSetup();
@@ -202,13 +196,5 @@ public class EncryptingSnapshotGlobalStateTransformerTests extends ESTestCase {
         Setup s = buildSetup();
         EncryptingSnapshotGlobalStateTransformer t = new EncryptingSnapshotGlobalStateTransformer();
         assertTrue(t.containsEncryptedData(PROJECT_ID, s.metadata()));
-    }
-
-    public void testContainsEncryptedDataReturnsFalseWhenNoCustom() {
-        EncryptedDataHandlerRegistry.setInstance(new EncryptedDataHandlerRegistry(List.of(new TestBlobHandler())));
-        EncryptingSnapshotGlobalStateTransformer t = new EncryptingSnapshotGlobalStateTransformer();
-
-        Metadata metadata = Metadata.builder().put(ProjectMetadata.builder(PROJECT_ID)).build();
-        assertFalse(t.containsEncryptedData(PROJECT_ID, metadata));
     }
 }

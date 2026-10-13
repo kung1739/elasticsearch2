@@ -146,8 +146,6 @@ public class SnapshotEncryptedDataIT extends AbstractSnapshotIntegTestCase {
             .get()
             .getSnapshotInfo();
         assertThat(withoutGlobalState.state(), equalTo(SnapshotState.SUCCESS));
-
-        updateClusterSettings(Settings.builder().putNull(SnapshotsService.ENCRYPTED_DATA_REQUIRED_SETTING.getKey()));
     }
 
     private TestBlob blobInSnapshot(SnapshotInfo snapshotInfo) {

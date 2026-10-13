@@ -116,8 +116,8 @@ public final class SnapshotEncryptedData implements Writeable {
     }
 
     /**
-     * Parses an {@code encrypted_data} map value (the object that was the value of the {@code "encrypted_data"} key in the request body)
-     * . Throws {@link IllegalArgumentException} for malformed input, missing required fields, or unsupported types.
+     * Parses the value of the {@code encrypted_data} key in the request body. Throws {@link IllegalArgumentException} for malformed
+     * input, missing required fields, or unsupported types.
      */
     @SuppressWarnings("unchecked")
     public static SnapshotEncryptedData fromMap(Object value) {

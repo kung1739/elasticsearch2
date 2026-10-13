@@ -428,17 +428,11 @@ public class CreateSnapshotRequest extends MasterNodeRequest<CreateSnapshotReque
         return featureStates(featureStates.toArray(EMPTY_ARRAY));
     }
 
-    /**
-     * @return the encrypted-data parameters for this snapshot, or {@code null} if none were supplied
-     */
     @Nullable
     public SnapshotEncryptedData encryptedData() {
         return encryptedData;
     }
 
-    /**
-     * @param encryptedData encrypted-data parameters for this snapshot
-     */
     public CreateSnapshotRequest encryptedData(@Nullable SnapshotEncryptedData encryptedData) {
         this.encryptedData = encryptedData;
         return this;

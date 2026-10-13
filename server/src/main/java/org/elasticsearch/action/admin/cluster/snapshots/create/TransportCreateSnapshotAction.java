@@ -63,7 +63,6 @@ public class TransportCreateSnapshotAction extends TransportMasterNodeAction<Cre
 
     @Override
     protected void doExecute(Task task, CreateSnapshotRequest request, ActionListener<CreateSnapshotResponse> listener) {
-        // checked before forwarding: an older master would silently drop the field
         if (request.encryptedData() != null
             && featureService.clusterHasFeature(clusterService.state(), CreateSnapshotFeatures.ENCRYPTED_DATA) == false) {
             listener.onFailure(new IllegalArgumentException("[encrypted_data] is not supported until all nodes are upgraded"));

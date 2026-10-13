@@ -49,6 +49,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.UnaryOperator;
 
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
@@ -534,7 +535,7 @@ public class KeyRotationCoordinatorTests extends ESTestCase {
             }
 
             @Override
-            public TestCustom reEncrypt(TestCustom current, java.util.function.UnaryOperator<EncryptedData> rewrapper) {
+            public TestCustom reEncrypt(TestCustom current, UnaryOperator<EncryptedData> rewrapper) {
                 calls.incrementAndGet();
                 return current;
             }
@@ -574,7 +575,7 @@ public class KeyRotationCoordinatorTests extends ESTestCase {
             }
 
             @Override
-            public TestCustom reEncrypt(TestCustom current, java.util.function.UnaryOperator<EncryptedData> rewrapper) {
+            public TestCustom reEncrypt(TestCustom current, UnaryOperator<EncryptedData> rewrapper) {
                 calls.incrementAndGet();
                 return null;
             }
@@ -763,7 +764,7 @@ public class KeyRotationCoordinatorTests extends ESTestCase {
             }
 
             @Override
-            public TestCustom reEncrypt(TestCustom current, java.util.function.UnaryOperator<EncryptedData> rewrapper) {
+            public TestCustom reEncrypt(TestCustom current, UnaryOperator<EncryptedData> rewrapper) {
                 calls.incrementAndGet();
                 return TestCustom.encryptedUnder(expectedKeyId);
             }

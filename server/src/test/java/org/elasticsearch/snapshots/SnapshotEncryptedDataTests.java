@@ -12,28 +12,31 @@ package org.elasticsearch.snapshots;
 import org.elasticsearch.common.settings.SecureString;
 import org.elasticsearch.test.ESTestCase;
 
+import java.util.List;
 import java.util.Map;
+
+import static org.hamcrest.Matchers.containsString;
 
 public class SnapshotEncryptedDataTests extends ESTestCase {
 
-    // --- fromMap ---
+    private static final List<String> TEMPLATES = List.of("${MY_SECRET_PASS}", "$MY_SECRET_PASS", "{{ .mySecret }}", "%MY_SECRET_PASS%");
 
     public void testFromMapMissingTypeThrows() {
         var e = expectThrows(
             IllegalArgumentException.class,
             () -> SnapshotEncryptedData.fromMap(Map.of("password", "correcthorsebatterystaple"))
         );
-        assertThat(e.getMessage(), org.hamcrest.Matchers.containsString("type is required"));
+        assertThat(e.getMessage(), containsString("type is required"));
     }
 
     public void testFromMapUnknownTypeThrows() {
         var e = expectThrows(IllegalArgumentException.class, () -> SnapshotEncryptedData.fromMap(Map.of("type", "hardware_token")));
-        assertThat(e.getMessage(), org.hamcrest.Matchers.containsString("unknown encrypted_data.type"));
+        assertThat(e.getMessage(), containsString("unknown encrypted_data.type"));
     }
 
     public void testFromMapSecureSettingRejected() {
         var e = expectThrows(IllegalArgumentException.class, () -> SnapshotEncryptedData.fromMap(Map.of("type", "secure_setting")));
-        assertThat(e.getMessage(), org.hamcrest.Matchers.containsString("not supported yet"));
+        assertThat(e.getMessage(), containsString("not supported yet"));
     }
 
     public void testFromMapUnknownFieldThrows() {
@@ -41,7 +44,7 @@ public class SnapshotEncryptedDataTests extends ESTestCase {
             IllegalArgumentException.class,
             () -> SnapshotEncryptedData.fromMap(Map.of("type", "password", "alien_field", "value"))
         );
-        assertThat(e.getMessage(), org.hamcrest.Matchers.containsString("unknown field"));
+        assertThat(e.getMessage(), containsString("unknown field"));
     }
 
     public void testFromMapPasswordTypeNoPassword() {
@@ -51,42 +54,34 @@ public class SnapshotEncryptedDataTests extends ESTestCase {
     }
 
     public void testFromMapPasswordTypeWithPassword() {
-        SnapshotEncryptedData result = SnapshotEncryptedData.fromMap(Map.of("type", "password", "password", "correcthorsebatterystaple"));
-        assertEquals("password", result.type());
-        assertNotNull(result.password());
-        assertEquals("correcthorsebatterystaple", result.password().toString());
-    }
-
-    public void testFromMapPasswordTypeWithPasswordId() {
         SnapshotEncryptedData result = SnapshotEncryptedData.fromMap(
-            Map.of("type", "password", "password", "a-very-long-passphrase-ok", "password_id", "my_id")
+            Map.of("type", "password", "password", "correcthorsebatterystaple", "password_id", "my_id")
         );
+        assertEquals("password", result.type());
+        assertEquals("correcthorsebatterystaple", result.password().toString());
         assertEquals("my_id", result.passwordId());
     }
 
     public void testFromMapNotAnObjectThrows() {
         var e = expectThrows(IllegalArgumentException.class, () -> SnapshotEncryptedData.fromMap("string_value"));
-        assertThat(e.getMessage(), org.hamcrest.Matchers.containsString("should be an object"));
+        assertThat(e.getMessage(), containsString("should be an object"));
     }
-
-    // --- validatePassword ---
 
     public void testValidatePasswordTooShort() {
         var e = expectThrows(
             IllegalArgumentException.class,
             () -> SnapshotEncryptedData.validatePassword(new SecureString("tooshort".toCharArray()))
         );
-        assertThat(e.getMessage(), org.hamcrest.Matchers.containsString("at least 15 characters"));
+        assertThat(e.getMessage(), containsString("at least 15 characters"));
     }
 
     public void testValidatePasswordExactlyMinLength() {
-        // 15 chars — must not throw
         SnapshotEncryptedData.validatePassword(new SecureString("aaaaaaaaaaaaaaa".toCharArray()));
     }
 
     public void testValidatePasswordNull() {
         var e = expectThrows(IllegalArgumentException.class, () -> SnapshotEncryptedData.validatePassword(null));
-        assertThat(e.getMessage(), org.hamcrest.Matchers.containsString("at least 15 characters"));
+        assertThat(e.getMessage(), containsString("at least 15 characters"));
     }
 
     public void testValidatePasswordSentinelRejected() {
@@ -94,66 +89,23 @@ public class SnapshotEncryptedDataTests extends ESTestCase {
             IllegalArgumentException.class,
             () -> SnapshotEncryptedData.validatePassword(new SecureString("::es_redacted::".toCharArray()))
         );
-        assertThat(e.getMessage(), org.hamcrest.Matchers.containsString("redaction sentinel"));
+        assertThat(e.getMessage(), containsString("redaction sentinel"));
     }
 
-    // Template patterns — only purely bare templates are rejected; passwords containing them are fine.
-
-    public void testValidateDollarBraceRejected() {
-        // Exactly ${VAR}
-        expectThrows(
-            IllegalArgumentException.class,
-            () -> SnapshotEncryptedData.validatePassword(new SecureString("${MY_SECRET_PASS}".toCharArray()))
-        );
+    public void testValidateBareTemplateRejected() {
+        for (String template : TEMPLATES) {
+            for (String password : List.of(template, "  " + template + "  ")) {
+                expectThrows(
+                    IllegalArgumentException.class,
+                    () -> SnapshotEncryptedData.validatePassword(new SecureString(password.toCharArray()))
+                );
+            }
+        }
     }
 
-    public void testValidateDollarBraceWithPrefixAccepted() {
-        // Has a prefix — not a bare template
-        SnapshotEncryptedData.validatePassword(new SecureString("x${MY_SECRET_PASS}extra".toCharArray()));
-    }
-
-    public void testValidateDollarVarRejected() {
-        expectThrows(
-            IllegalArgumentException.class,
-            () -> SnapshotEncryptedData.validatePassword(new SecureString("$MY_SECRET_PASS".toCharArray()))
-        );
-    }
-
-    public void testValidateDollarVarWithSuffixAccepted() {
-        SnapshotEncryptedData.validatePassword(new SecureString("prefix$MY_SECRET_PASSsuffix".toCharArray()));
-    }
-
-    public void testValidateMustacheRejected() {
-        expectThrows(
-            IllegalArgumentException.class,
-            () -> SnapshotEncryptedData.validatePassword(new SecureString("{{ .mySecret }}".toCharArray()))
-        );
-    }
-
-    public void testValidateMustacheWithPrefixAccepted() {
-        SnapshotEncryptedData.validatePassword(new SecureString("extra{{ .mySecret }}andmore".toCharArray()));
-    }
-
-    public void testValidatePercentVarRejected() {
-        expectThrows(
-            IllegalArgumentException.class,
-            () -> SnapshotEncryptedData.validatePassword(new SecureString("%MY_SECRET_PASS%".toCharArray()))
-        );
-    }
-
-    public void testValidatePercentVarWithPrefixAccepted() {
-        SnapshotEncryptedData.validatePassword(new SecureString("some%MY_SECRET_PASS%more".toCharArray()));
-    }
-
-    public void testValidateDollarBraceWithLeadingWhitespaceRejected() {
-        // Leading/trailing whitespace only — still a bare template
-        expectThrows(
-            IllegalArgumentException.class,
-            () -> SnapshotEncryptedData.validatePassword(new SecureString("  ${MY_SECRET}  ".toCharArray()))
-        );
-    }
-
-    public void testValidateNormalPasswordAccepted() {
-        SnapshotEncryptedData.validatePassword(new SecureString("correcthorsebatterystaple".toCharArray()));
+    public void testValidateTemplateInsideLongerPasswordAccepted() {
+        for (String template : TEMPLATES) {
+            SnapshotEncryptedData.validatePassword(new SecureString(("prefix" + template + "suffix").toCharArray()));
+        }
     }
 }

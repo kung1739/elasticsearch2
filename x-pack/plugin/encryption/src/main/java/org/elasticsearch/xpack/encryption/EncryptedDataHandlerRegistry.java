@@ -31,8 +31,6 @@ public record EncryptedDataHandlerRegistry(List<EncryptedDataHandler<?>> handler
     }
 
     /**
-     * Registers this registry in the static slot so SPI-instantiated components (e.g.
-     * {@link EncryptingSnapshotGlobalStateTransformer}) that are created outside Guice can resolve it lazily.
      * Called by {@link EncryptionPlugin} from {@code createComponents}.
      */
     static void setInstance(EncryptedDataHandlerRegistry registry) {

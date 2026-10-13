@@ -31,6 +31,7 @@ import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.function.UnaryOperator;
 
 public class TransportEncryptionResetActionTests extends ESTestCase {
 
@@ -106,7 +107,7 @@ public class TransportEncryptionResetActionTests extends ESTestCase {
             }
 
             @Override
-            public TestCustom reEncrypt(TestCustom current, java.util.function.UnaryOperator<EncryptedData> rewrapper) {
+            public TestCustom reEncrypt(TestCustom current, UnaryOperator<EncryptedData> rewrapper) {
                 return current;
             }
 
@@ -194,7 +195,7 @@ public class TransportEncryptionResetActionTests extends ESTestCase {
         }
 
         @Override
-        public TestCustom reEncrypt(TestCustom current, java.util.function.UnaryOperator<EncryptedData> rewrapper) {
+        public TestCustom reEncrypt(TestCustom current, UnaryOperator<EncryptedData> rewrapper) {
             return current;
         }
 

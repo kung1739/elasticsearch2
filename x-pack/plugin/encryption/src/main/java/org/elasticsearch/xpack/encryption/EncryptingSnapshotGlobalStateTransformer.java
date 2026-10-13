@@ -47,28 +47,11 @@ public final class EncryptingSnapshotGlobalStateTransformer implements SnapshotG
 
     @Override
     public Metadata transformForSnapshot(ProjectId projectId, Metadata metadata, @Nullable SecureString password) {
-        EncryptedDataHandlerRegistry registry = EncryptedDataHandlerRegistry.getInstance();
-        if (registry == null || registry.handlers().isEmpty()) {
+        if (containsEncryptedData(projectId, metadata) == false) {
             return metadata;
         }
-
+        final EncryptedDataHandlerRegistry registry = EncryptedDataHandlerRegistry.getInstance();
         final ProjectMetadata project = metadata.getProject(projectId);
-        if (project == null) {
-            return metadata;
-        }
-
-        // Skip customs that are not in SNAPSHOT context — the repository layer won't write them anyway.
-        boolean anySnapshotCustom = false;
-        for (EncryptedDataHandler<?> handler : registry.handlers()) {
-            Metadata.ProjectCustom custom = project.custom(handler.customName());
-            if (custom != null && custom.context().contains(Metadata.XContentContext.SNAPSHOT)) {
-                anySnapshotCustom = true;
-                break;
-            }
-        }
-        if (anySnapshotCustom == false) {
-            return metadata;
-        }
 
         if (password == null) {
             logger.warn(
