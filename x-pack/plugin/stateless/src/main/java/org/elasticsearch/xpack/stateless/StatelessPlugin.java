@@ -812,7 +812,14 @@ public class StatelessPlugin extends Plugin
         final Collection<Object> components = new ArrayList<>();
         var objectStoreService = setAndGet(
             this.objectStoreService,
-            createObjectStoreService(settings, services.repositoriesService(), threadPool, clusterService, projectResolver.get())
+            createObjectStoreService(
+                settings,
+                services.repositoriesService(),
+                threadPool,
+                clusterService,
+                projectResolver.get(),
+                meterRegistry
+            )
         );
         if (projectResolver.get().supportsMultipleProjects()) {
             clusterService.addStateApplier(objectStoreService);
@@ -925,7 +932,8 @@ public class StatelessPlugin extends Plugin
                 settings,
                 objectStoreService,
                 consistencyService,
-                projectResolver.get().supportsMultipleProjects()
+                projectResolver.get().supportsMultipleProjects(),
+                meterRegistry
             )
         );
         setAndGet(this.translogReplicatorMetrics, new TranslogRecoveryMetrics(meterRegistry));
@@ -1194,9 +1202,10 @@ public class StatelessPlugin extends Plugin
         RepositoriesService repositoriesService,
         ThreadPool threadPool,
         ClusterService clusterService,
-        ProjectResolver projectResolver
+        ProjectResolver projectResolver,
+        MeterRegistry meterRegistry
     ) {
-        return new ObjectStoreService(settings, repositoriesService, threadPool, clusterService, projectResolver);
+        return new ObjectStoreService(settings, repositoriesService, threadPool, clusterService, projectResolver, meterRegistry);
     }
 
     protected StatelessSharedBlobCacheService createSharedBlobCacheService(
