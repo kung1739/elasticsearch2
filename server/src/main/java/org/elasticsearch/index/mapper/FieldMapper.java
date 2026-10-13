@@ -189,16 +189,25 @@ public abstract class FieldMapper extends Mapper {
         }
         if (hasSkipper) {
             throw new IllegalArgumentException(
-                "[doc_values.updatable] cannot be combined with a doc values skip index on field [" + field + "]"
+                "[doc_values.updatable] cannot be combined with a doc values skip index on field ["
+                    + field
+                    + "]: the skip index stores per-range value bounds computed at index time that an in-place update would leave stale"
             );
         }
         if (docValues.multiValue()) {
-            throw new IllegalArgumentException("[doc_values.updatable] requires [doc_values.multi_value:false] on field [" + field + "]");
+            throw new IllegalArgumentException(
+                "[doc_values.updatable] requires [doc_values.multi_value:false] on field ["
+                    + field
+                    + "]: Lucene can only replace a single doc values value per document, so multi-valued doc values cannot be updated"
+            );
         }
         var sortConfig = indexSettings.getIndexSortConfig();
         if (sortConfig != null && sortConfig.hasSortOnField(field)) {
             throw new IllegalArgumentException(
-                "[doc_values.updatable] cannot be set on field [" + field + "] because it is used in the index sort"
+                "[doc_values.updatable] cannot be set on field ["
+                    + field
+                    + "] because it is used in the index sort: documents are physically ordered by this field at index time "
+                    + "and an in-place update cannot reorder them"
             );
         }
         if (indexSettings.sequenceNumbersDisabled()) {
